@@ -5,6 +5,9 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.Drawable
 import android.content.ContentValues
 import android.os.Build
 import android.os.Environment
@@ -16,6 +19,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.URLConnection
 import java.util.concurrent.Executors
@@ -24,16 +28,21 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val HOTSPOT_CHANNEL = "wasla/local_hotspot"
         private const val DOWNLOADS_CHANNEL = "wasla/downloads"
+        private const val INSTALLED_APPS_CHANNEL = "wasla/installed_apps"
         private const val PERMISSION_REQUEST_CODE = 53317
         private const val STORAGE_PERMISSION_REQUEST_CODE = 53318
         private const val DOWNLOAD_RELATIVE_PATH = "Download/Wasla/"
         private val downloadExecutor = Executors.newSingleThreadExecutor { task ->
             Thread(task, "WaslaDownloadPublisher").apply { isDaemon = true }
         }
+        private val appQueryExecutor = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "WaslaInstalledApps").apply { isDaemon = true }
+        }
     }
 
     private lateinit var hotspotChannel: MethodChannel
     private lateinit var downloadsChannel: MethodChannel
+    private lateinit var installedAppsChannel: MethodChannel
     private var hotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var permissionResult: MethodChannel.Result? = null
     private var hotspotResult: MethodChannel.Result? = null
@@ -68,6 +77,95 @@ class MainActivity : FlutterActivity() {
                 "publishDownload" -> publishDownload(call, result)
                 else -> result.notImplemented()
             }
+        }
+        installedAppsChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            INSTALLED_APPS_CHANNEL,
+        )
+        installedAppsChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "listInstalledUserApps" -> listInstalledUserApps(result)
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun listInstalledUserApps(result: MethodChannel.Result) {
+        appQueryExecutor.execute {
+            try {
+                val flags = PackageManager.GET_META_DATA
+                val applications = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    packageManager.getInstalledApplications(
+                        PackageManager.ApplicationInfoFlags.of(flags.toLong()),
+                    )
+                } else {
+                    packageManager.getInstalledApplications(flags)
+                }
+                val userApps = applications
+                    .asSequence()
+                    .filter { app ->
+                        app.packageName != packageName &&
+                            app.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM == 0 &&
+                            app.flags and android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP == 0
+                    }
+                    .mapNotNull { app ->
+                        val baseApk = app.sourceDir
+                        val apkPaths = (listOfNotNull(baseApk) + (app.splitSourceDirs ?: emptyArray()))
+                            .distinct()
+                            .mapNotNull { path ->
+                                val apk = File(path)
+                                if (apk.isFile && apk.canRead()) {
+                                    apk.canonicalPath
+                                } else {
+                                    null
+                                }
+                            }
+                        if (apkPaths.isEmpty()) return@mapNotNull null
+
+                        val label = packageManager.getApplicationLabel(app).toString()
+                        val icon = try {
+                            drawableToPng(packageManager.getApplicationIcon(app))
+                        } catch (_: Exception) {
+                            null
+                        }
+                        mapOf(
+                            "appName" to label,
+                            "packageName" to app.packageName,
+                            "versionName" to packageManager.getPackageInfo(
+                                app.packageName,
+                                0,
+                            ).versionName,
+                            "apkPaths" to apkPaths,
+                            "icon" to icon,
+                        )
+                    }
+                    .sortedBy { (it["appName"] as String).lowercase() }
+                    .toList()
+
+                runOnUiThread { result.success(userApps) }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    result.error(
+                        "installed_apps_failed",
+                        error.message ?: "تعذّر قراءة التطبيقات المثبتة.",
+                        null,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun drawableToPng(drawable: Drawable): ByteArray {
+        val size = 96
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        drawable.setBounds(0, 0, size, size)
+        drawable.draw(canvas)
+        return ByteArrayOutputStream().use { output ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+            bitmap.recycle()
+            output.toByteArray()
         }
     }
 

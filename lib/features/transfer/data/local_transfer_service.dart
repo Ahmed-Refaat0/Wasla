@@ -4,20 +4,23 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../../devices/domain/discovered_device.dart';
-import 'android_download_publisher.dart';
 import '../domain/transfer_file_source.dart';
 import '../domain/transfer_snapshot.dart';
+import 'android_download_publisher.dart';
+import 'transfer_crypto.dart';
 
 class LocalTransferService extends ChangeNotifier {
   static const int port = 53317;
   static const int maxFileSizeBytes = 50 * 1024 * 1024 * 1024;
-  static const int _maxOfferBodyBytes = 16 * 1024;
+  static const int _maxControlBodyBytes = 16 * 1024;
   static const int _maxPendingOffers = 4;
   static const Duration _offerTimeout = Duration(minutes: 2);
+  static const int _chunkSize = TransferCrypto.chunkSize;
 
   LocalTransferService({
     int? serverPort,
@@ -40,7 +43,11 @@ class LocalTransferService extends ChangeNotifier {
   final AndroidDownloadPublisher _androidDownloadPublisher;
   final bool Function() _isAndroid;
   final Map<String, _TransferRecord> _records = {};
+  final Map<String, _PendingHandshake> _handshakes = {};
+  final Set<String> _handshakesBeingCreated = {};
   final Set<String> _reservedDestinations = {};
+  final Map<String, int> _handshakeCreationsByPeer = {};
+  int _handshakeCreations = 0;
   HttpServer? _server;
   HttpClient? _httpClient;
   bool _disposed = false;
@@ -61,7 +68,6 @@ class LocalTransferService extends ChangeNotifier {
   Future<void> start() async {
     if (_disposed || _server != null) return;
     _serverError = null;
-
     try {
       final server = await HttpServer.bind(
         InternetAddress.anyIPv4,
@@ -116,7 +122,6 @@ class LocalTransferService extends ChangeNotifier {
     if (!device.canConnect) {
       throw StateError('The selected device has no resolved network address.');
     }
-
     final address = _selectAddress(device);
     for (final source in sources) {
       await _sendFile(source, device, address);
@@ -136,7 +141,7 @@ class LocalTransferService extends ChangeNotifier {
       totalBytes: source.size,
       peerName: device.name.isEmpty ? device.platform : device.name,
     );
-    if (record.totalBytes > maxFileSizeBytes) {
+    if (record.totalBytes < 0 || record.totalBytes > maxFileSizeBytes) {
       record
         ..status = TransferStatus.failed
         ..errorMessage = 'الحد الأقصى لحجم الملف هو ٥٠ جيجابايت.';
@@ -147,69 +152,141 @@ class LocalTransferService extends ChangeNotifier {
 
     _records[record.id] = record;
     _notifyListeners();
-
+    TransferCrypto? crypto;
     try {
       final client = _httpClient;
       if (client == null) throw StateError('HTTP client is not available.');
       final baseUri = Uri(scheme: 'http', host: address, port: device.port);
-      final offerRequest = await client.postUrl(
-        baseUri.replace(path: '/v1/offers'),
-      );
-      offerRequest.headers.contentType = ContentType.json;
-      offerRequest.write(
+      final keyPair = await TransferCrypto.createKeyPair();
+      final senderPublicKey = await keyPair.extractPublicKey();
+      final senderNonce = TransferCrypto.createNonce();
+      final handshakeBody = utf8.encode(
         jsonEncode({
           'id': record.id,
+          'publicKey': TransferCrypto.encodeBytes(senderPublicKey.bytes),
+          'nonce': TransferCrypto.encodeBytes(senderNonce),
+        }),
+      );
+      final handshakeResponse = await _postBytes(
+        client,
+        baseUri.replace(path: '/v2/handshakes'),
+        handshakeBody,
+      );
+      if (handshakeResponse.statusCode != HttpStatus.ok) {
+        throw HttpException(
+          _readErrorMessage(await _readResponseBody(handshakeResponse)),
+          uri: baseUri,
+        );
+      }
+
+      final handshake = jsonDecode(await _readResponseBody(handshakeResponse));
+      if (handshake is! Map<String, dynamic> ||
+          handshake['publicKey'] is! String ||
+          handshake['nonce'] is! String) {
+        throw const FormatException(
+          'The receiving device returned an invalid security handshake.',
+        );
+      }
+      final receiverPublicKey = TransferCrypto.decodeBytes(
+        handshake['publicKey'] as String,
+        expectedLength: 32,
+      );
+      final receiverNonce = TransferCrypto.decodeBytes(
+        handshake['nonce'] as String,
+        expectedLength: 32,
+      );
+      crypto = await TransferCrypto.derive(
+        transferId: record.id,
+        localKeyPair: keyPair,
+        remotePublicKey: receiverPublicKey,
+        senderPublicKey: senderPublicKey.bytes,
+        receiverPublicKey: receiverPublicKey,
+        senderNonce: senderNonce,
+        receiverNonce: receiverNonce,
+      );
+      record.pairingCode = await crypto.verificationCode;
+      _notifyListeners();
+
+      final metadata = utf8.encode(
+        jsonEncode({
           'name': record.fileName,
           'size': record.totalBytes,
           'sender': Platform.operatingSystem,
         }),
       );
+      final encryptedMetadata = await crypto.encryptMetadata(metadata);
+      final offerBody = utf8.encode(
+        jsonEncode({
+          'id': record.id,
+          'cipherText': TransferCrypto.encodeBytes(
+            encryptedMetadata.cipherText,
+          ),
+          'mac': TransferCrypto.encodeBytes(encryptedMetadata.mac.bytes),
+        }),
+      );
+      const offerPath = '/v2/offers';
+      final offerRequest = await client.postUrl(
+        baseUri.replace(path: offerPath),
+      );
+      offerRequest.headers.contentType = ContentType.json;
+      offerRequest.headers.set(
+        HttpHeaders.authorizationHeader,
+        await crypto.authorization(
+          method: 'POST',
+          path: offerPath,
+          sequence: 0,
+          body: offerBody,
+        ),
+      );
+      offerRequest.add(offerBody);
       final offerResponse = await offerRequest.close();
-      final offerBody = await _readResponseBody(offerResponse);
+      final offerResponseBody = await _readResponseBody(offerResponse);
       if (offerResponse.statusCode != HttpStatus.ok) {
-        final message = _readErrorMessage(offerBody);
-        throw HttpException(message, uri: baseUri);
+        throw HttpException(_readErrorMessage(offerResponseBody), uri: baseUri);
       }
-
-      final offer = jsonDecode(offerBody);
-      if (offer is! Map<String, dynamic> || offer['token'] is! String) {
+      final offerResult = jsonDecode(offerResponseBody);
+      if (offerResult is! Map<String, dynamic> ||
+          offerResult['proof'] is! String ||
+          !await crypto.verifyAcceptanceProof(offerResult['proof'] as String)) {
         throw const FormatException(
-          'The receiving device returned an invalid offer response.',
+          'The receiver acceptance could not be authenticated.',
         );
       }
 
       record.status = TransferStatus.transferring;
       _notifyListeners();
-
+      final uploadPath = '/v2/files/${record.id}';
       final uploadRequest = await client.putUrl(
-        baseUri.replace(path: '/v1/files/${record.id}'),
+        baseUri.replace(path: uploadPath),
       );
       uploadRequest.headers.contentType = ContentType.binary;
       uploadRequest.headers.set(
         HttpHeaders.authorizationHeader,
-        'Bearer ${offer['token']}',
+        await crypto.authorization(
+          method: 'PUT',
+          path: uploadPath,
+          sequence: 1,
+          body: const [],
+        ),
       );
-      uploadRequest.contentLength = record.totalBytes;
+      final frameCount = (record.totalBytes + _chunkSize - 1) ~/ _chunkSize;
+      uploadRequest.contentLength =
+          record.totalBytes + frameCount * TransferCrypto.frameOverhead;
       final stopwatch = Stopwatch()..start();
       var lastNotification = Duration.zero;
       await uploadRequest.addStream(
-        source.openRead().transform(
-          StreamTransformer<List<int>, List<int>>.fromHandlers(
-            handleData: (chunk, sink) {
-              sink.add(chunk);
-              record.transferredBytes += chunk.length;
-              record.bytesPerSecond = stopwatch.elapsedMicroseconds == 0
-                  ? 0
-                  : record.transferredBytes *
-                        Duration.microsecondsPerSecond /
-                        stopwatch.elapsedMicroseconds;
-              if (stopwatch.elapsed - lastNotification >=
-                  const Duration(milliseconds: 100)) {
-                lastNotification = stopwatch.elapsed;
-                _notifyListeners();
-              }
-            },
-          ),
+        _encryptedChunks(
+          source,
+          crypto,
+          record,
+          stopwatch,
+          onProgress: () {
+            if (stopwatch.elapsed - lastNotification >=
+                const Duration(milliseconds: 100)) {
+              lastNotification = stopwatch.elapsed;
+              _notifyListeners();
+            }
+          },
         ),
       );
 
@@ -217,6 +294,17 @@ class LocalTransferService extends ChangeNotifier {
       final responseBody = await _readResponseBody(uploadResponse);
       if (uploadResponse.statusCode != HttpStatus.created) {
         throw HttpException(_readErrorMessage(responseBody), uri: baseUri);
+      }
+      final uploadResult = jsonDecode(responseBody);
+      if (uploadResult is! Map<String, dynamic> ||
+          uploadResult['proof'] is! String ||
+          !await crypto.verifyCompletionProof(
+            uploadResult['proof'] as String,
+            record.totalBytes,
+          )) {
+        throw const FormatException(
+          'The receiver completion could not be authenticated.',
+        );
       }
 
       record
@@ -231,25 +319,89 @@ class LocalTransferService extends ChangeNotifier {
       _reportError(error, stackTrace, 'Could not send ${record.fileName}.');
       _notifyListeners();
       _trimRecords();
+    } finally {
+      crypto?.destroy();
     }
+  }
+
+  Stream<List<int>> _encryptedChunks(
+    TransferFileSource source,
+    TransferCrypto crypto,
+    _TransferRecord record,
+    Stopwatch stopwatch, {
+    required VoidCallback onProgress,
+  }) async* {
+    final pending = BytesBuilder(copy: false);
+    var sourceBytes = 0;
+    var index = 0;
+
+    Future<Uint8List> encodeFrame(List<int> clearText) async {
+      final box = await crypto.encryptChunk(clearText, index++);
+      final frame = Uint8List(4 + box.cipherText.length + box.mac.bytes.length);
+      ByteData.sublistView(
+        frame,
+      ).setUint32(0, box.cipherText.length + box.mac.bytes.length, Endian.big);
+      frame.setRange(4, 4 + box.cipherText.length, box.cipherText);
+      frame.setRange(4 + box.cipherText.length, frame.length, box.mac.bytes);
+      record.transferredBytes += clearText.length;
+      record.bytesPerSecond = stopwatch.elapsedMicroseconds == 0
+          ? 0
+          : record.transferredBytes *
+                Duration.microsecondsPerSecond /
+                stopwatch.elapsedMicroseconds;
+      onProgress();
+      return frame;
+    }
+
+    await for (final bytes in source.openRead()) {
+      sourceBytes += bytes.length;
+      if (sourceBytes > source.size) {
+        throw const FormatException(
+          'Source returned more bytes than declared.',
+        );
+      }
+      final input = bytes is Uint8List ? bytes : Uint8List.fromList(bytes);
+      var offset = 0;
+      if (pending.length > 0) {
+        final needed = _chunkSize - pending.length;
+        final take = min(needed, input.length);
+        pending.add(input.sublist(0, take));
+        offset = take;
+        if (pending.length == _chunkSize) {
+          yield await encodeFrame(pending.takeBytes());
+        }
+      }
+      while (offset + _chunkSize <= input.length) {
+        yield await encodeFrame(
+          Uint8List.sublistView(input, offset, offset + _chunkSize),
+        );
+        offset += _chunkSize;
+      }
+      if (offset < input.length) pending.add(input.sublist(offset));
+    }
+    if (sourceBytes != source.size) {
+      throw const FormatException('Source ended before its declared length.');
+    }
+    if (pending.length > 0) yield await encodeFrame(pending.takeBytes());
   }
 
   void accept(String transferId) {
     final record = _records[transferId];
     if (record == null ||
         record.status != TransferStatus.awaitingApproval ||
-        record.decision == null) {
+        record.decision == null ||
+        record.crypto == null) {
       return;
     }
-
     record.status = TransferStatus.waitingForUpload;
     record.uploadTimer = Timer(_offerTimeout, () {
       if (record.status != TransferStatus.waitingForUpload) return;
       record
         ..status = TransferStatus.failed
         ..errorMessage = 'انتهت مهلة بدء إرسال الملف.'
-        ..token = null
         ..uploadTimer = null;
+      record.crypto?.destroy();
+      record.crypto = null;
       _notifyListeners();
       _trimRecords();
     });
@@ -264,42 +416,42 @@ class LocalTransferService extends ChangeNotifier {
         record.decision == null) {
       return;
     }
-
     record
       ..status = TransferStatus.rejected
-      ..token = null
       ..decision!.complete(false);
+    record.crypto?.destroy();
+    record.crypto = null;
     _notifyListeners();
     _trimRecords();
   }
 
   Future<void> _handleRequest(HttpRequest request) async {
     try {
-      if (request.method == 'GET' && request.uri.path == '/health') {
-        await _writeJson(request.response, HttpStatus.ok, {'status': 'ready'});
+      if (request.method == 'POST' && request.uri.path == '/v2/handshakes') {
+        await _handleHandshake(request);
         return;
       }
-
-      if (request.method == 'POST' && request.uri.path == '/v1/offers') {
+      if (request.method == 'POST' && request.uri.path == '/v2/offers') {
         await _handleOffer(request);
         return;
       }
-
       if (request.method == 'PUT' &&
           request.uri.pathSegments.length == 3 &&
-          request.uri.pathSegments[0] == 'v1' &&
+          request.uri.pathSegments[0] == 'v2' &&
           request.uri.pathSegments[1] == 'files') {
         await _handleUpload(request, request.uri.pathSegments[2]);
         return;
       }
-
       await _writeJson(request.response, HttpStatus.notFound, {
         'error': 'المسار المطلوب غير موجود.',
       });
     } catch (error, stackTrace) {
       _reportError(error, stackTrace, 'Could not handle an HTTP request.');
       try {
-        await request.response.close();
+        request.response.persistentConnection = false;
+        await _writeJson(request.response, HttpStatus.badRequest, {
+          'error': 'تعذّر معالجة طلب النقل الآمن.',
+        });
       } on HttpException catch (closeError, closeStackTrace) {
         _reportError(
           closeError,
@@ -312,91 +464,217 @@ class LocalTransferService extends ChangeNotifier {
           closeStackTrace,
           'Could not close the failed HTTP response.',
         );
+      } on SocketException catch (closeError, closeStackTrace) {
+        _reportError(
+          closeError,
+          closeStackTrace,
+          'Could not close the failed HTTP response.',
+        );
+      }
+    }
+  }
+
+  Future<void> _handleHandshake(HttpRequest request) async {
+    final body = await _readLimitedRequest(request, _maxControlBodyBytes);
+    final decoded = jsonDecode(utf8.decode(body));
+    if (decoded is! Map<String, dynamic> ||
+        decoded['id'] is! String ||
+        decoded['publicKey'] is! String ||
+        decoded['nonce'] is! String) {
+      await _writeJson(request.response, HttpStatus.badRequest, {
+        'error': 'بيانات المصافحة غير صالحة.',
+      });
+      return;
+    }
+
+    final id = decoded['id'] as String;
+    if (!RegExp(r'^[a-f0-9]{32}$').hasMatch(id) ||
+        _records.containsKey(id) ||
+        _handshakes.containsKey(id) ||
+        _handshakesBeingCreated.contains(id)) {
+      await _writeJson(request.response, HttpStatus.conflict, {
+        'error': 'معرّف المصافحة غير صالح أو مستخدم بالفعل.',
+      });
+      return;
+    }
+    final activeTransfers = _records.values
+        .where((record) => record.snapshot.isActive)
+        .length;
+    if (_handshakes.length + _handshakeCreations + activeTransfers >=
+        _maxPendingOffers) {
+      await _writeJson(request.response, HttpStatus.tooManyRequests, {
+        'error': 'هناك طلبات نقل معلّقة كثيرة؛ حاول لاحقًا.',
+      });
+      return;
+    }
+    final peerAddress =
+        request.connectionInfo?.remoteAddress.address ?? 'unknown';
+    final creatingFromPeer = _handshakeCreationsByPeer[peerAddress] ?? 0;
+    final pendingFromPeer = _handshakes.values
+        .where((handshake) => handshake.peerAddress == peerAddress)
+        .length;
+    if (creatingFromPeer + pendingFromPeer >= 2) {
+      await _writeJson(request.response, HttpStatus.tooManyRequests, {
+        'error': 'يوجد عدد كبير من طلبات المصافحة من هذا الجهاز.',
+      });
+      return;
+    }
+
+    final senderPublicKey = TransferCrypto.decodeBytes(
+      decoded['publicKey'] as String,
+      expectedLength: 32,
+    );
+    final senderNonce = TransferCrypto.decodeBytes(
+      decoded['nonce'] as String,
+      expectedLength: 32,
+    );
+    _handshakeCreations++;
+    _handshakesBeingCreated.add(id);
+    _handshakeCreationsByPeer.update(
+      peerAddress,
+      (count) => count + 1,
+      ifAbsent: () => 1,
+    );
+    try {
+      final keyPair = await TransferCrypto.createKeyPair();
+      final receiverPublicKey = await keyPair.extractPublicKey();
+      final receiverNonce = TransferCrypto.createNonce();
+      final crypto = await TransferCrypto.derive(
+        transferId: id,
+        localKeyPair: keyPair,
+        remotePublicKey: senderPublicKey,
+        senderPublicKey: senderPublicKey,
+        receiverPublicKey: receiverPublicKey.bytes,
+        senderNonce: senderNonce,
+        receiverNonce: receiverNonce,
+      );
+      final pending = _PendingHandshake(
+        id: id,
+        crypto: crypto,
+        peerAddress: peerAddress,
+      );
+      pending.timer = Timer(_offerTimeout, () {
+        if (identical(_handshakes[id], pending)) {
+          _handshakes.remove(id);
+          crypto.destroy();
+        }
+      });
+      _handshakes[id] = pending;
+      await _writeJson(request.response, HttpStatus.ok, {
+        'publicKey': TransferCrypto.encodeBytes(receiverPublicKey.bytes),
+        'nonce': TransferCrypto.encodeBytes(receiverNonce),
+      });
+    } finally {
+      _handshakeCreations--;
+      _handshakesBeingCreated.remove(id);
+      final remaining = (_handshakeCreationsByPeer[peerAddress] ?? 1) - 1;
+      if (remaining == 0) {
+        _handshakeCreationsByPeer.remove(peerAddress);
+      } else {
+        _handshakeCreationsByPeer[peerAddress] = remaining;
       }
     }
   }
 
   Future<void> _handleOffer(HttpRequest request) async {
-    if (request.contentLength > _maxOfferBodyBytes) {
-      request.response.persistentConnection = false;
-      await _writeJson(request.response, HttpStatus.requestEntityTooLarge, {
-        'error': 'بيانات طلب النقل أكبر من الحد المسموح.',
-      });
-      return;
-    }
-
-    String body;
-    try {
-      body = await _readSmallBody(request);
-    } on FormatException {
-      request.response.persistentConnection = false;
-      await _writeJson(request.response, HttpStatus.requestEntityTooLarge, {
-        'error': 'بيانات طلب النقل أكبر من الحد المسموح.',
-      });
-      return;
-    }
-
-    Object? decoded;
-    try {
-      decoded = jsonDecode(body);
-    } on FormatException {
-      await _writeJson(request.response, HttpStatus.badRequest, {
-        'error': 'بيانات طلب النقل غير صالحة.',
-      });
-      return;
-    }
-    if (decoded is! Map<String, dynamic>) {
+    final body = await _readLimitedRequest(request, _maxControlBodyBytes);
+    final decoded = jsonDecode(utf8.decode(body));
+    if (decoded is! Map<String, dynamic> ||
+        decoded['id'] is! String ||
+        decoded['cipherText'] is! String ||
+        decoded['mac'] is! String) {
       await _writeJson(request.response, HttpStatus.badRequest, {
         'error': 'بيانات طلب النقل غير صالحة.',
       });
       return;
     }
 
-    final id = decoded['id'];
-    final name = decoded['name'];
-    final size = decoded['size'];
-    final sender = decoded['sender'];
-    if (id is! String ||
-        !RegExp(r'^[a-f0-9]{32}$').hasMatch(id) ||
-        name is! String ||
-        size is! int ||
-        size < 0 ||
-        size > maxFileSizeBytes ||
-        sender is! String) {
+    final id = decoded['id'] as String;
+    final pending = _handshakes[id];
+    if (pending == null) {
+      await _writeJson(request.response, HttpStatus.notFound, {
+        'error': 'جلسة المصافحة غير موجودة أو انتهت.',
+      });
+      return;
+    }
+    final authorization = request.headers.value(
+      HttpHeaders.authorizationHeader,
+    );
+    if (authorization == null ||
+        !await pending.crypto.verifyAuthorization(
+          authorization: authorization,
+          method: 'POST',
+          path: '/v2/offers',
+          sequence: 0,
+          body: body,
+        )) {
+      await _writeJson(request.response, HttpStatus.unauthorized, {
+        'error': 'تعذّر التحقق من طلب النقل.',
+      });
+      return;
+    }
+    if (!identical(_handshakes[id], pending) || pending.claimed) {
+      await _writeJson(request.response, HttpStatus.conflict, {
+        'error': 'تم استخدام طلب النقل بالفعل أو انتهت صلاحيته.',
+      });
+      return;
+    }
+    pending
+      ..claimed = true
+      ..timer?.cancel();
+
+    Uint8List clearText;
+    Map<String, dynamic> metadata;
+    try {
+      final cipherText = TransferCrypto.decodeBytes(
+        decoded['cipherText'] as String,
+      );
+      final mac = TransferCrypto.decodeBytes(
+        decoded['mac'] as String,
+        expectedLength: TransferCrypto.tagLength,
+      );
+      clearText = await pending.crypto.decryptMetadata(
+        cipherText: cipherText,
+        mac: mac,
+      );
+      final decodedMetadata = jsonDecode(utf8.decode(clearText));
+      if (decodedMetadata is! Map<String, dynamic> ||
+          decodedMetadata['name'] is! String ||
+          decodedMetadata['size'] is! int ||
+          decodedMetadata['sender'] is! String ||
+          (decodedMetadata['size'] as int) < 0 ||
+          (decodedMetadata['size'] as int) > maxFileSizeBytes) {
+        throw const FormatException('Invalid encrypted transfer metadata.');
+      }
+      metadata = decodedMetadata;
+    } on SecretBoxAuthenticationError {
+      _handshakes.remove(id);
+      pending.crypto.destroy();
+      await _writeJson(request.response, HttpStatus.unauthorized, {
+        'error': 'تعذّر التحقق من تشفير بيانات النقل.',
+      });
+      return;
+    } on FormatException {
+      _handshakes.remove(id);
+      pending.crypto.destroy();
       await _writeJson(request.response, HttpStatus.badRequest, {
         'error': 'بيانات الملف غير مكتملة أو حجم الملف غير مقبول.',
       });
       return;
     }
 
-    if (_records.values.any((record) => record.id == id)) {
-      await _writeJson(request.response, HttpStatus.conflict, {
-        'error': 'معرّف النقل مستخدم بالفعل.',
-      });
-      return;
-    }
-
-    final pendingCount = _records.values
-        .where((record) => record.status == TransferStatus.awaitingApproval)
-        .length;
-    if (pendingCount >= _maxPendingOffers) {
-      await _writeJson(request.response, HttpStatus.tooManyRequests, {
-        'error': 'هناك طلبات نقل معلّقة كثيرة؛ حاول لاحقًا.',
-      });
-      return;
-    }
-
-    final record =
-        _TransferRecord(
-            id: id,
-            fileName: _safeFileName(name),
-            direction: TransferDirection.incoming,
-            status: TransferStatus.awaitingApproval,
-            totalBytes: size,
-            peerName: sender,
-          )
-          ..token = _randomHex(32)
-          ..decision = Completer<bool>();
+    final pairingCode = await pending.crypto.verificationCode;
+    _handshakes.remove(id);
+    final record = _TransferRecord(
+      id: id,
+      fileName: _safeFileName(metadata['name'] as String),
+      direction: TransferDirection.incoming,
+      status: TransferStatus.awaitingApproval,
+      totalBytes: metadata['size'] as int,
+      peerName: metadata['sender'] as String,
+      pairingCode: pairingCode,
+      crypto: pending.crypto,
+    )..decision = Completer<bool>();
     _records[id] = record;
     _notifyListeners();
 
@@ -408,8 +686,9 @@ class LocalTransferService extends ChangeNotifier {
       if (record.status == TransferStatus.awaitingApproval) {
         record
           ..status = TransferStatus.failed
-          ..errorMessage = 'انتهت مهلة الموافقة على طلب الاستقبال.'
-          ..token = null;
+          ..errorMessage = 'انتهت مهلة الموافقة على طلب الاستقبال.';
+        record.crypto?.destroy();
+        record.crypto = null;
         _notifyListeners();
       }
       await _writeJson(
@@ -423,12 +702,16 @@ class LocalTransferService extends ChangeNotifier {
       return;
     }
 
-    await _writeJson(request.response, HttpStatus.ok, {'token': record.token});
+    await _writeJson(request.response, HttpStatus.ok, {
+      'proof': await pending.crypto.acceptanceProof(),
+    });
   }
 
   Future<void> _handleUpload(HttpRequest request, String id) async {
     final record = _records[id];
+    final crypto = record?.crypto;
     if (record == null ||
+        crypto == null ||
         record.direction != TransferDirection.incoming ||
         record.status != TransferStatus.waitingForUpload) {
       await _writeJson(request.response, HttpStatus.notFound, {
@@ -437,25 +720,46 @@ class LocalTransferService extends ChangeNotifier {
       return;
     }
 
+    final path = '/v2/files/$id';
     final authorization = request.headers.value(
       HttpHeaders.authorizationHeader,
     );
-    if (authorization != 'Bearer ${record.token}') {
-      await _writeJson(request.response, HttpStatus.forbidden, {
-        'error': 'رمز استقبال الملف غير صالح.',
+    final authorized =
+        authorization != null &&
+        await crypto.verifyAuthorization(
+          authorization: authorization,
+          method: 'PUT',
+          path: path,
+          sequence: 1,
+          body: const [],
+        );
+    if (!authorized) {
+      await _writeJson(request.response, HttpStatus.unauthorized, {
+        'error': 'رمز التحقق لطلب النقل غير صالح.',
+      });
+      return;
+    }
+    if (record.status != TransferStatus.waitingForUpload ||
+        record.crypto != crypto) {
+      await _writeJson(request.response, HttpStatus.conflict, {
+        'error': 'تم استخدام طلب النقل بالفعل.',
       });
       return;
     }
 
-    if (request.contentLength != record.totalBytes) {
+    final frameCount = (record.totalBytes + _chunkSize - 1) ~/ _chunkSize;
+    final expectedLength =
+        record.totalBytes + frameCount * TransferCrypto.frameOverhead;
+    if (request.contentLength != expectedLength) {
       request.response.persistentConnection = false;
       await _writeJson(request.response, HttpStatus.badRequest, {
-        'error': 'حجم الملف المرسل لا يطابق الحجم المعلن.',
+        'error': 'حجم الملف المشفر لا يطابق البيانات المعلنة.',
       });
       record
         ..status = TransferStatus.failed
-        ..errorMessage = 'حجم الملف المرسل لا يطابق الحجم المعلن.'
-        ..token = null;
+        ..errorMessage = 'حجم الملف المشفر لا يطابق البيانات المعلنة.';
+      crypto.destroy();
+      record.crypto = null;
       _notifyListeners();
       return;
     }
@@ -463,48 +767,74 @@ class LocalTransferService extends ChangeNotifier {
     record.uploadTimer?.cancel();
     record.uploadTimer = null;
     record.status = TransferStatus.transferring;
-    record.token = null;
     _notifyListeners();
 
     File? partialFile;
     RandomAccessFile? sink;
+    String? reservedDestination;
+    var committed = false;
     try {
       final directory = await _ensureSaveDirectory();
-      final destination = await _availableDestination(
+      reservedDestination = await _availableDestination(
         directory,
         record.fileName,
       );
-      partialFile = File(destination);
+      partialFile = File(
+        '$directory${Platform.pathSeparator}.wasla-${record.id}.part',
+      );
+      await partialFile.create(exclusive: true);
       sink = await partialFile.open(mode: FileMode.writeOnly);
       final stopwatch = Stopwatch()..start();
       var lastNotification = Duration.zero;
-      await for (final chunk in request.timeout(const Duration(seconds: 45))) {
-        await sink.writeFrom(chunk);
-        record.transferredBytes += chunk.length;
-        if (record.transferredBytes > record.totalBytes) {
-          throw const FormatException('Received more bytes than declared.');
+      final reader = _ByteStreamReader(
+        request.timeout(const Duration(seconds: 45)),
+      );
+      var receivedBytes = 0;
+      var index = 0;
+      try {
+        while (receivedBytes < record.totalBytes) {
+          final header = await reader.readExactly(4);
+          final frameLength = ByteData.sublistView(header)
+              .getUint32(0, Endian.big);
+          final plainLength = min(
+            _chunkSize,
+            record.totalBytes - receivedBytes,
+          );
+          if (frameLength != plainLength + TransferCrypto.tagLength) {
+            throw const FormatException('Invalid encrypted chunk frame.');
+          }
+          final frame = await reader.readExactly(frameLength);
+          final clearText = await crypto.decryptChunk(
+            cipherText: frame.sublist(0, plainLength),
+            mac: frame.sublist(plainLength),
+            index: index++,
+            clearTextLength: plainLength,
+          );
+          await sink.writeFrom(clearText);
+          receivedBytes += clearText.length;
+          record.transferredBytes = receivedBytes;
+          record.bytesPerSecond = stopwatch.elapsedMicroseconds == 0
+              ? 0
+              : receivedBytes *
+                    Duration.microsecondsPerSecond /
+                    stopwatch.elapsedMicroseconds;
+          if (stopwatch.elapsed - lastNotification >=
+              const Duration(milliseconds: 100)) {
+            lastNotification = stopwatch.elapsed;
+            _notifyListeners();
+          }
         }
-        record.bytesPerSecond = stopwatch.elapsedMicroseconds == 0
-            ? 0
-            : record.transferredBytes *
-                  Duration.microsecondsPerSecond /
-                  stopwatch.elapsedMicroseconds;
-        if (stopwatch.elapsed - lastNotification >=
-            const Duration(milliseconds: 100)) {
-          lastNotification = stopwatch.elapsed;
-          _notifyListeners();
+        if (await reader.hasMore) {
+          throw const FormatException('Unexpected trailing encrypted data.');
         }
+      } finally {
+        await reader.cancel();
       }
       await sink.close();
       sink = null;
+      final proof = await crypto.completionProof(record.totalBytes);
 
-      if (record.transferredBytes != record.totalBytes) {
-        throw const FormatException(
-          'The upload ended before all bytes arrived.',
-        );
-      }
-
-      var savedPath = destination;
+      var savedPath = reservedDestination;
       if (_isAndroid()) {
         final published = await _androidDownloadPublisher.publish(
           source: partialFile,
@@ -512,41 +842,55 @@ class LocalTransferService extends ChangeNotifier {
         );
         record
           ..fileName = published.fileName
-          ..savedPath = published.path;
+          ..savedPath = published.path
+          ..status = TransferStatus.completed;
         savedPath = published.path;
-        _reservedDestinations.remove(destination);
+        committed = true;
         try {
           await partialFile.delete();
         } on FileSystemException catch (cleanupError, cleanupStackTrace) {
           _reportError(
             cleanupError,
             cleanupStackTrace,
-            'Could not remove the temporary file after publishing its download.',
+            'Could not remove the staging file after publishing the download.',
           );
         }
+      } else {
+        await partialFile.rename(reservedDestination);
+        committed = true;
+        record.status = TransferStatus.completed;
       }
-      record
-        ..status = TransferStatus.completed
-        ..savedPath = savedPath;
-      _reservedDestinations.remove(destination);
+
+      record.savedPath = savedPath;
+      record.uploadTimer?.cancel();
+      record.uploadTimer = null;
+      crypto.destroy();
+      record.crypto = null;
+      _reservedDestinations.remove(reservedDestination);
       _notifyListeners();
-      await _writeJson(request.response, HttpStatus.created, {'saved': true});
+      await _writeJson(request.response, HttpStatus.created, {'proof': proof});
       _trimRecords();
     } catch (error, stackTrace) {
+      if (committed) {
+        _reportError(
+          error,
+          stackTrace,
+          'The receiver could not finish the transfer response.',
+        );
+        return;
+      }
       try {
         await sink?.close();
       } on FileSystemException catch (closeError, closeStackTrace) {
         _reportError(
           closeError,
           closeStackTrace,
-          'Could not close the incomplete received file.',
+          'Could not close partial file.',
         );
       }
       if (partialFile != null) {
         try {
-          if (await partialFile.exists()) {
-            await partialFile.delete();
-          }
+          if (await partialFile.exists()) await partialFile.delete();
         } on FileSystemException catch (cleanupError, cleanupStackTrace) {
           _reportError(
             cleanupError,
@@ -554,14 +898,17 @@ class LocalTransferService extends ChangeNotifier {
             'Could not remove an incomplete received file.',
           );
         }
-        _reservedDestinations.remove(partialFile.path);
+      }
+      if (reservedDestination != null) {
+        _reservedDestinations.remove(reservedDestination);
       }
       record
         ..status = TransferStatus.failed
-        ..errorMessage = error.toString()
-        ..token = null;
+        ..errorMessage = 'تعذّر حفظ الملف بعد استقبال البيانات.';
       record.uploadTimer?.cancel();
       record.uploadTimer = null;
+      crypto.destroy();
+      record.crypto = null;
       _reportError(error, stackTrace, 'Could not save ${record.fileName}.');
       _notifyListeners();
       _trimRecords();
@@ -569,6 +916,19 @@ class LocalTransferService extends ChangeNotifier {
         'error': 'تعذّر حفظ الملف بعد استقبال البيانات.',
       });
     }
+  }
+
+  Future<HttpClientResponse> _postBytes(
+    HttpClient client,
+    Uri uri,
+    List<int> body,
+  ) async {
+    final request = await client.postUrl(uri);
+    request
+      ..headers.contentType = ContentType.json
+      ..contentLength = body.length
+      ..add(body);
+    return request.close();
   }
 
   Future<String> _ensureSaveDirectory() async {
@@ -593,7 +953,6 @@ class LocalTransferService extends ChangeNotifier {
       directory = null;
     }
     directory ??= await _documentsDirectoryProvider();
-
     final waslaDirectory = Directory(
       '${directory.path}${Platform.pathSeparator}Wasla',
     );
@@ -611,7 +970,6 @@ class LocalTransferService extends ChangeNotifier {
     final hasExtension = dot > 0;
     final stem = hasExtension ? fileName.substring(0, dot) : fileName;
     final extension = hasExtension ? fileName.substring(dot) : '';
-
     for (var index = 0; index < 10000; index++) {
       final suffix = index == 0 ? '' : ' ($index)';
       final candidate = File('$directory$separator$stem$suffix$extension');
@@ -625,17 +983,25 @@ class LocalTransferService extends ChangeNotifier {
     throw FileSystemException('Could not find a unique filename.', fileName);
   }
 
-  Future<String> _readSmallBody(HttpRequest request) async {
+  Future<Uint8List> _readLimitedRequest(
+    HttpRequest request,
+    int maximumBytes,
+  ) async {
+    if (request.contentLength > maximumBytes) {
+      request.response.persistentConnection = false;
+      throw const FormatException('Request body exceeds its allowed size.');
+    }
     final bytes = BytesBuilder(copy: false);
     var length = 0;
     await for (final chunk in request) {
       length += chunk.length;
-      if (length > _maxOfferBodyBytes) {
-        throw const FormatException('Offer body is too large.');
+      if (length > maximumBytes) {
+        request.response.persistentConnection = false;
+        throw const FormatException('Request body exceeds its allowed size.');
       }
       bytes.add(chunk);
     }
-    return utf8.decode(bytes.takeBytes());
+    return bytes.takeBytes();
   }
 
   Future<String> _readResponseBody(HttpClientResponse response) async {
@@ -643,10 +1009,8 @@ class LocalTransferService extends ChangeNotifier {
     var length = 0;
     await for (final chunk in response) {
       length += chunk.length;
-      if (length > _maxOfferBodyBytes) {
-        throw const FormatException(
-          'The remote device returned an oversized response.',
-        );
+      if (length > _maxControlBodyBytes) {
+        throw const FormatException('Remote response is too large.');
       }
       bytes.add(chunk);
     }
@@ -752,8 +1116,14 @@ class LocalTransferService extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    for (final pending in _handshakes.values) {
+      pending.timer?.cancel();
+      pending.crypto.destroy();
+    }
+    _handshakes.clear();
     for (final record in _records.values) {
       record.uploadTimer?.cancel();
+      record.crypto?.destroy();
       final decision = record.decision;
       if (decision != null && !decision.isCompleted) {
         decision.complete(false);
@@ -776,6 +1146,20 @@ class LocalTransferService extends ChangeNotifier {
   }
 }
 
+class _PendingHandshake {
+  _PendingHandshake({
+    required this.id,
+    required this.crypto,
+    required this.peerAddress,
+  });
+
+  final String id;
+  final TransferCrypto crypto;
+  final String peerAddress;
+  Timer? timer;
+  bool claimed = false;
+}
+
 class _TransferRecord {
   _TransferRecord({
     required this.id,
@@ -784,6 +1168,8 @@ class _TransferRecord {
     required this.status,
     required this.totalBytes,
     required this.peerName,
+    this.pairingCode,
+    this.crypto,
   });
 
   final String id;
@@ -797,7 +1183,8 @@ class _TransferRecord {
   TransferStatus status;
   String? errorMessage;
   String? savedPath;
-  String? token;
+  String? pairingCode;
+  TransferCrypto? crypto;
   Completer<bool>? decision;
   Timer? uploadTimer;
 
@@ -812,6 +1199,46 @@ class _TransferRecord {
     peerName: peerName,
     errorMessage: errorMessage,
     savedPath: savedPath,
+    pairingCode: pairingCode,
     createdAt: createdAt,
   );
+}
+
+class _ByteStreamReader {
+  _ByteStreamReader(Stream<List<int>> stream)
+    : _iterator = StreamIterator(stream);
+
+  final StreamIterator<List<int>> _iterator;
+  List<int> _current = const [];
+  int _offset = 0;
+
+  Future<Uint8List> readExactly(int length) async {
+    final result = Uint8List(length);
+    var written = 0;
+    while (written < length) {
+      if (_offset >= _current.length) {
+        if (!await _iterator.moveNext()) {
+          throw const FormatException('Encrypted upload ended unexpectedly.');
+        }
+        _current = _iterator.current;
+        _offset = 0;
+      }
+      final count = min(length - written, _current.length - _offset);
+      result.setRange(written, written + count, _current, _offset);
+      written += count;
+      _offset += count;
+    }
+    return result;
+  }
+
+  Future<bool> get hasMore async {
+    while (_offset >= _current.length) {
+      if (!await _iterator.moveNext()) return false;
+      _current = _iterator.current;
+      _offset = 0;
+    }
+    return true;
+  }
+
+  Future<void> cancel() => _iterator.cancel();
 }

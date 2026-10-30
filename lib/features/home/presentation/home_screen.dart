@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:desktop_drop/desktop_drop.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -12,10 +11,18 @@ import '../../devices/data/device_discovery_controller.dart';
 import '../../devices/domain/discovered_device.dart';
 import '../../transfer/data/local_transfer_service.dart';
 import '../../transfer/domain/transfer_file_source.dart';
+import 'file_selection_screen.dart';
 import '../../transfer/domain/transfer_snapshot.dart';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  const HomeScreen({
+    super.key,
+    required this.isDarkMode,
+    required this.onToggleTheme,
+  });
+
+  final bool isDarkMode;
+  final Future<void> Function() onToggleTheme;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -96,37 +103,13 @@ class _HomeScreenState extends State<HomeScreen> {
         throw StateError('خادم الاستقبال المحلي غير جاهز.');
       }
 
-      final pickedFiles = await FilePicker.pickFiles();
-      if (pickedFiles.isEmpty || !mounted) return;
-
-      final files = <File>[];
-      for (final pickedFile in pickedFiles) {
-        final path = pickedFile.path;
-        if (path == null) {
-          throw StateError('تعذّر الوصول إلى أحد الملفات المحددة.');
-        }
-        files.add(File(path));
-      }
-
-      await _sendFiles(files, device: device);
-    } catch (error) {
-      if (mounted) _showMessage(error.toString());
-    }
-  }
-
-  Future<void> _sendFiles(List<File> files, {DiscoveredDevice? device}) async {
-    try {
-      final sources = await Future.wait(
-        files.map(
-          (file) async => TransferFileSource(
-            name: file.uri.pathSegments.isEmpty
-                ? 'file'
-                : file.uri.pathSegments.last,
-            size: await file.length(),
-            openRead: file.openRead,
-          ),
-        ),
-      );
+      final sources = await Navigator.of(context)
+          .push<List<TransferFileSource>>(
+            MaterialPageRoute<List<TransferFileSource>>(
+              builder: (_) => const FileSelectionScreen(),
+            ),
+          );
+      if (sources == null || sources.isEmpty || !mounted) return;
       await _sendSources(sources, device: device);
     } catch (error) {
       if (mounted) _showMessage(error.toString());
@@ -313,21 +296,19 @@ class _HomeScreenState extends State<HomeScreen> {
         SnackBar(
           content: Text(message),
           behavior: SnackBarBehavior.floating,
-          backgroundColor: AppColors.ink,
+          backgroundColor: AppColors.snackbar,
         ),
       );
   }
 
-  void _showComingSoon(BuildContext context, String feature) {
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: Text('$feature سيتوفر في الخطوة القادمة.'),
-          behavior: SnackBarBehavior.floating,
-          backgroundColor: AppColors.ink,
-        ),
-      );
+  Future<void> _toggleTheme() async {
+    try {
+      await widget.onToggleTheme();
+    } catch (error) {
+      if (mounted) {
+        _showMessage('تعذّر حفظ إعداد المظهر: $error');
+      }
+    }
   }
 
   @override
@@ -337,6 +318,7 @@ class _HomeScreenState extends State<HomeScreen> {
       child: AnimatedBuilder(
         animation: _discovery,
         builder: (context, _) => Scaffold(
+          backgroundColor: Theme.of(context).scaffoldBackgroundColor,
           body: SafeArea(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -357,8 +339,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                       children: [
                         _TopBar(
-                          onSettings: () =>
-                              _showComingSoon(context, 'الإعدادات'),
+                          isDarkMode: widget.isDarkMode,
+                          onToggleTheme: () => unawaited(_toggleTheme()),
                         ),
                         const SizedBox(height: 34),
                         _PageHeading(
@@ -499,9 +481,10 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 class _TopBar extends StatelessWidget {
-  const _TopBar({required this.onSettings});
+  const _TopBar({required this.isDarkMode, required this.onToggleTheme});
 
-  final VoidCallback onSettings;
+  final bool isDarkMode;
+  final VoidCallback onToggleTheme;
 
   @override
   Widget build(BuildContext context) {
@@ -514,9 +497,9 @@ class _TopBar extends StatelessWidget {
             color: AppColors.brand,
             borderRadius: BorderRadius.circular(15),
           ),
-          child: const Icon(
+          child: Icon(
             Icons.swap_horiz_rounded,
-            color: Colors.white,
+            color: AppColors.onBrand,
             size: 27,
           ),
         ),
@@ -532,7 +515,7 @@ class _TopBar extends StatelessWidget {
             color: AppColors.brandTint,
             borderRadius: BorderRadius.circular(20),
           ),
-          child: const Text(
+          child: Text(
             'نقل محلي',
             style: TextStyle(
               color: AppColors.brandDark,
@@ -543,14 +526,17 @@ class _TopBar extends StatelessWidget {
         ),
         const Spacer(),
         IconButton(
-          onPressed: onSettings,
-          tooltip: 'الإعدادات',
+          onPressed: onToggleTheme,
+          tooltip: isDarkMode ? 'تفعيل الوضع الفاتح' : 'تفعيل الوضع الداكن',
           style: IconButton.styleFrom(
-            backgroundColor: Colors.white,
-            side: const BorderSide(color: AppColors.line),
+            backgroundColor: AppColors.surface,
+            side: BorderSide(color: AppColors.line),
             fixedSize: const Size(44, 44),
           ),
-          icon: const Icon(Icons.tune_rounded, size: 20),
+          icon: Icon(
+            isDarkMode ? Icons.light_mode_rounded : Icons.dark_mode_rounded,
+            size: 20,
+          ),
         ),
       ],
     );
@@ -639,7 +625,7 @@ class _LocalHotspotPanel extends StatelessWidget {
         children: [
           Row(
             children: [
-              const _SectionIcon(
+              _SectionIcon(
                 icon: Icons.wifi_tethering_rounded,
                 background: AppColors.blueTint,
                 foreground: AppColors.brandDark,
@@ -710,12 +696,12 @@ class _LocalHotspotPanel extends StatelessWidget {
               FilledButton.icon(
                 onPressed: isBusy ? null : onToggle,
                 icon: isBusy
-                    ? const SizedBox(
+                    ? SizedBox(
                         width: 18,
                         height: 18,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
-                          color: Colors.white,
+                          color: AppColors.onBrand,
                         ),
                       )
                     : const Icon(Icons.wifi_tethering_rounded, size: 19),
@@ -788,12 +774,12 @@ class _SearchButton extends StatelessWidget {
       child: FilledButton.icon(
         onPressed: onPressed,
         icon: isSearching
-            ? const SizedBox(
+            ? SizedBox(
                 width: 18,
                 height: 18,
                 child: CircularProgressIndicator(
                   strokeWidth: 2,
-                  color: Colors.white,
+                  color: AppColors.onBrand,
                 ),
               )
             : const Icon(Icons.radar_rounded, size: 19),
@@ -881,13 +867,13 @@ class _ModeButton extends StatelessWidget {
                   Icon(
                     icon,
                     size: 19,
-                    color: selected ? Colors.white : AppColors.muted,
+                    color: selected ? AppColors.onBrand : AppColors.muted,
                   ),
                   const SizedBox(width: 8),
                   Text(
                     label,
                     style: TextStyle(
-                      color: selected ? Colors.white : AppColors.ink,
+                      color: selected ? AppColors.onBrand : AppColors.ink,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
@@ -899,13 +885,13 @@ class _ModeButton extends StatelessWidget {
                         vertical: 2,
                       ),
                       decoration: BoxDecoration(
-                        color: selected ? Colors.white : AppColors.brand,
+                        color: selected ? AppColors.brand : AppColors.onBrand,
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: Text(
                         _arabicDigits(badgeCount),
                         style: TextStyle(
-                          color: selected ? AppColors.brand : Colors.white,
+                          color: selected ? AppColors.brand : AppColors.onBrand,
                           fontSize: 10,
                           fontWeight: FontWeight.w700,
                         ),
@@ -943,7 +929,7 @@ class _ReceiveReadyPanel extends StatelessWidget {
         children: [
           Row(
             children: [
-              const _SectionIcon(
+              _SectionIcon(
                 icon: Icons.download_rounded,
                 background: AppColors.brandTint,
                 foreground: AppColors.brand,
@@ -969,7 +955,7 @@ class _ReceiveReadyPanel extends StatelessWidget {
               ),
               Icon(
                 isRunning ? Icons.wifi_rounded : Icons.wifi_off_rounded,
-                color: isRunning ? AppColors.brand : Colors.deepOrange,
+                color: isRunning ? AppColors.brand : AppColors.danger,
               ),
             ],
           ),
@@ -985,7 +971,7 @@ class _ReceiveReadyPanel extends StatelessWidget {
             const SizedBox(height: 12),
             _TransferNotice(
               icon: Icons.error_outline_rounded,
-              color: Colors.deepOrange,
+              color: AppColors.danger,
               text: serverError!,
             ),
             Align(
@@ -1028,10 +1014,10 @@ class _DevicesPanel extends StatelessWidget {
         children: [
           Row(
             children: [
-              const _SectionIcon(
+              _SectionIcon(
                 icon: Icons.devices_rounded,
                 background: AppColors.blueTint,
-                foreground: Color(0xFF4A68B8),
+                foreground: AppColors.blue,
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -1076,7 +1062,7 @@ class _DevicesPanel extends StatelessWidget {
             constraints: BoxConstraints(minHeight: devices.isEmpty ? 230 : 100),
             padding: EdgeInsets.all(devices.isEmpty ? 22 : 10),
             decoration: BoxDecoration(
-              color: const Color(0xFFFAFCFC),
+              color: AppColors.tile,
               borderRadius: BorderRadius.circular(18),
               border: Border.all(color: AppColors.line),
             ),
@@ -1094,7 +1080,7 @@ class _DevicesPanel extends StatelessWidget {
                           onTap: () => onDeviceSelected(devices[index]),
                         ),
                         if (index != devices.length - 1)
-                          const Divider(height: 1, color: AppColors.line),
+                          Divider(height: 1, color: AppColors.line),
                       ],
                     ],
                   ),
@@ -1142,18 +1128,18 @@ class _EmptyDevicesState extends StatelessWidget {
               Container(
                 width: 76,
                 height: 76,
-                decoration: const BoxDecoration(
+                decoration: BoxDecoration(
                   color: AppColors.brandTint,
                   shape: BoxShape.circle,
                 ),
               ),
               Icon(
                 hasError ? Icons.wifi_off_rounded : Icons.devices_other_rounded,
-                color: hasError ? Colors.deepOrange : AppColors.brand,
+                color: hasError ? AppColors.danger : AppColors.brand,
                 size: 34,
               ),
               if (!hasError)
-                const Positioned(
+                Positioned(
                   bottom: 1,
                   right: 1,
                   child: SizedBox(
@@ -1315,7 +1301,7 @@ class _SendPanelState extends State<_SendPanel> {
         children: [
           Row(
             children: [
-              const _SectionIcon(
+              _SectionIcon(
                 icon: Icons.upload_file_rounded,
                 background: AppColors.brandTint,
                 foreground: AppColors.brand,
@@ -1353,12 +1339,10 @@ class _SendPanelState extends State<_SendPanel> {
               decoration: BoxDecoration(
                 color: _isDragging
                     ? AppColors.brandTint
-                    : const Color(0xFFF7FBFA),
+                    : AppColors.dropSurface,
                 borderRadius: BorderRadius.circular(18),
                 border: Border.all(
-                  color: _isDragging
-                      ? AppColors.brand
-                      : const Color(0xFFB8DCD7),
+                  color: _isDragging ? AppColors.brand : AppColors.dropBorder,
                   width: _isDragging ? 2 : 1.3,
                 ),
               ),
@@ -1368,11 +1352,11 @@ class _SendPanelState extends State<_SendPanel> {
                   Container(
                     width: 58,
                     height: 58,
-                    decoration: const BoxDecoration(
+                    decoration: BoxDecoration(
                       color: AppColors.brandTint,
                       shape: BoxShape.circle,
                     ),
-                    child: const Icon(
+                    child: Icon(
                       Icons.cloud_upload_outlined,
                       color: AppColors.brand,
                       size: 29,
@@ -1402,7 +1386,7 @@ class _SendPanelState extends State<_SendPanel> {
             ),
           ),
           const SizedBox(height: 14),
-          const Row(
+          Row(
             children: [
               Icon(Icons.wifi_rounded, size: 16, color: AppColors.brand),
               SizedBox(width: 7),
@@ -1452,10 +1436,10 @@ class _TransfersPanel extends StatelessWidget {
         children: [
           Row(
             children: [
-              const _SectionIcon(
+              _SectionIcon(
                 icon: Icons.swap_vert_rounded,
-                background: Color(0xFFFFF3E8),
-                foreground: Color(0xFFC47B32),
+                background: AppColors.orangeTint,
+                foreground: AppColors.orange,
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -1483,7 +1467,7 @@ class _TransfersPanel extends StatelessWidget {
                 Expanded(
                   child: _TransferNotice(
                     icon: Icons.error_outline_rounded,
-                    color: Colors.deepOrange,
+                    color: AppColors.danger,
                     text:
                         'تعذّر تشغيل خادم الاستقبال على المنفذ 53317: $serverError',
                   ),
@@ -1506,7 +1490,7 @@ class _TransfersPanel extends StatelessWidget {
           ],
           if (transfers.isNotEmpty) ...[
             const SizedBox(height: 16),
-            const Divider(height: 1, color: AppColors.line),
+            Divider(height: 1, color: AppColors.line),
             for (var index = 0; index < transfers.length; index++) ...[
               _TransferRow(
                 transfer: transfers[index],
@@ -1514,7 +1498,7 @@ class _TransfersPanel extends StatelessWidget {
                 onReject: () => onReject(transfers[index].id),
               ),
               if (index != transfers.length - 1)
-                const Divider(height: 1, color: AppColors.line),
+                Divider(height: 1, color: AppColors.line),
             ],
           ],
         ],
@@ -1582,6 +1566,36 @@ class _TransferRow extends StatelessWidget {
           ),
           const SizedBox(height: 7),
           Text(status, style: Theme.of(context).textTheme.bodyMedium),
+          if (transfer.pairingCode != null &&
+              (transfer.status == TransferStatus.requesting ||
+                  transfer.status == TransferStatus.awaitingApproval)) ...[
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: AppColors.blueTint,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: AppColors.line),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'رمز التحقق: ${transfer.pairingCode}',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    incoming
+                        ? 'قارن الرمز مع المرسل عبر وسيلة موثوقة. ارفض النقل إذا اختلف.'
+                        : 'تأكد أن الرمز مطابق لما يظهر على جهاز الاستقبال.',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ],
+              ),
+            ),
+          ],
           if (transfer.status == TransferStatus.transferring ||
               transfer.status == TransferStatus.completed) ...[
             const SizedBox(height: 8),
@@ -1602,7 +1616,7 @@ class _TransferRow extends StatelessWidget {
                 FilledButton.icon(
                   onPressed: onAccept,
                   icon: const Icon(Icons.check_rounded, size: 18),
-                  label: const Text('قبول الاستقبال'),
+                  label: const Text('تحقق من الرمز ثم قبول'),
                 ),
                 OutlinedButton.icon(
                   onPressed: onReject,
@@ -1667,14 +1681,14 @@ class _PrivacyNote extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Row(
+    return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
         Icon(Icons.info_outline_rounded, size: 15, color: AppColors.muted),
         SizedBox(width: 7),
         Flexible(
           child: Text(
-            'النقل محلي دون سحابة، لكنه غير مشفّر حاليًا؛ استخدم شبكة موثوقة.',
+            'النقل مشفّر أثناء الإرسال؛ طابق رمز التحقق قبل القبول. الملفات المحفوظة غير مشفّرة.',
             textAlign: TextAlign.center,
             style: TextStyle(color: AppColors.muted, fontSize: 11, height: 1.5),
           ),
@@ -1698,9 +1712,9 @@ class _Panel extends StatelessWidget {
         color: AppColors.surface,
         borderRadius: BorderRadius.circular(22),
         border: Border.all(color: AppColors.line),
-        boxShadow: const [
+        boxShadow: [
           BoxShadow(
-            color: Color(0x07172B36),
+            color: AppColors.shadow,
             blurRadius: 22,
             offset: Offset(0, 7),
           ),

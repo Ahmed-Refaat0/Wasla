@@ -23,6 +23,7 @@ class TransferSnapshot {
     required this.createdAt,
     this.errorMessage,
     this.savedPath,
+    this.pairingCode,
   });
 
   final String id;
@@ -36,6 +37,7 @@ class TransferSnapshot {
   final DateTime createdAt;
   final String? errorMessage;
   final String? savedPath;
+  final String? pairingCode;
 
   double get progress => totalBytes == 0
       ? (status == TransferStatus.completed ? 1 : 0)
@@ -46,11 +48,10 @@ class TransferSnapshot {
       status == TransferStatus.awaitingApproval;
 
   bool get isActive => switch (status) {
-        TransferStatus.requesting ||
-        TransferStatus.awaitingApproval ||
-        TransferStatus.waitingForUpload ||
-        TransferStatus.transferring =>
-          true,
-        _ => false,
-      };
+    TransferStatus.requesting ||
+    TransferStatus.awaitingApproval ||
+    TransferStatus.waitingForUpload ||
+    TransferStatus.transferring => true,
+    _ => false,
+  };
 }

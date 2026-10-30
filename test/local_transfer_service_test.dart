@@ -57,6 +57,8 @@ void main() {
     final incoming = receiver.transfers.single;
     expect(incoming.fileName, 'sample.txt');
     expect(incoming.totalBytes, await source.length());
+    expect(incoming.pairingCode, matches(RegExp(r'^\d{6}$')));
+    expect(sender.transfers.single.pairingCode, incoming.pairingCode);
 
     receiver.accept(incoming.id);
     await sendFuture.timeout(const Duration(seconds: 10));
@@ -154,6 +156,25 @@ void main() {
     expect(outgoing.bytesPerSecond, greaterThan(0));
     expect(sawIntermediateProgress, isTrue);
     expect(sawReceivedIntermediateProgress, isTrue);
+  });
+
+  test('legacy unauthenticated transfer endpoints are disabled', () async {
+    final receiver = LocalTransferService(serverPort: 0);
+    addTearDown(receiver.dispose);
+    await receiver.start();
+
+    final client = HttpClient();
+    addTearDown(client.close);
+    final response = await (await client.postUrl(
+      Uri(
+        scheme: 'http',
+        host: '127.0.0.1',
+        port: receiver.listeningPort,
+        path: '/v1/offers',
+      ),
+    )).close();
+    await response.drain<void>();
+    expect(response.statusCode, HttpStatus.notFound);
   });
 }
 
