@@ -1,6 +1,6 @@
 # وصلة
 
-تطبيق Flutter لنقل الملفات مباشرةً بين الأجهزة المتصلة بالشبكة المحلية.
+تطبيق Flutter لنقل الملفات مباشرةً بين الأجهزة المتصلة بالشبكة المحلي.
 
 ## تنزيل التطبيق
 
@@ -9,43 +9,6 @@
 - [عرض كل الإصدارات والتنزيلات](https://github.com/Ahmed-Refaat0/Wasla/releases)
 
 نسخة Android الحالية تجريبية ومخصّصة للاختبار، وليست إصدارًا موقّعًا للنشر على Google Play. على Windows، فك ضغط الملف كاملًا ثم شغّل `wasla.exe`.
-
-## المتطلبات
-
-- Flutter 3.47.7 أو أحدث وDart 3.13 أو أحدث.
-- Windows: Visual Studio 2022 مع workload ‏**Desktop development with C++**، بما في ذلك CMake وWindows SDK.
-- Android: Android Studio مع Android SDK وPlatform Tools، ثم قبول التراخيص عبر `flutter doctor --android-licenses`.
-- Linux: أدوات بناء C++ وCMake وNinja، وخدمة Avahi (`avahi-daemon`).
-- iOS وmacOS: جهاز Mac وXcode؛ إعدادات Bonjour والشبكة المحلية موجودة في ملفات المنصات.
-
-## تشغيل التطبيق
-
-من جذر المشروع:
-
-```powershell
-flutter doctor -v
-flutter pub get
-flutter analyze
-flutter test
-flutter devices
-flutter run -d windows
-```
-
-استبدل `windows` بمعرّف الجهاز الذي يظهر في `flutter devices` لتشغيل التطبيق على منصة أخرى. لإنشاء APK تجريبي على Android:
-
-```powershell
-flutter build apk --debug
-```
-
-### نسخة Windows مستقلة
-
-لبناء التطبيق كنافذة Windows بملفاتها اللازمة للتشغيل، وليس كأمر يحتاج إلى إبقاء الطرفية مفتوحة:
-
-```powershell
-flutter build windows --release
-```
-
-بعد البناء افتح `build\windows\x64\runner\Release\wasla.exe` مباشرةً. لمشاركة التطبيق، انسخ **مجلد Release كاملًا**؛ لا تنسخ ملف EXE وحده لأن بقية الملفات والمجلدات مطلوبة للتشغيل. يتطلب Windows تثبيت Microsoft Visual C++ Redistributable المناسب لمعمارية الجهاز.
 
 ## تجربة النقل
 
