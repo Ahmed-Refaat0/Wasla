@@ -4,8 +4,10 @@ import 'dart:io';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../../app/theme/app_theme.dart';
+import '../../connection/data/local_hotspot_controller.dart';
 import '../../devices/data/device_discovery_controller.dart';
 import '../../devices/domain/discovered_device.dart';
 import '../../transfer/data/local_transfer_service.dart';
@@ -20,6 +22,7 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  final LocalHotspotController _hotspot = LocalHotspotController();
   final DeviceDiscoveryController _discovery = DeviceDiscoveryController();
   final LocalTransferService _transfers = LocalTransferService();
 
@@ -45,9 +48,40 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _hotspot.dispose();
     _discovery.dispose();
     _transfers.dispose();
     super.dispose();
+  }
+
+  Future<void> _toggleHotspot() async {
+    try {
+      if (_hotspot.isActive) {
+        await _hotspot.stop();
+      } else {
+        await _hotspot.start();
+        if (mounted && _transfers.isRunning) {
+          await _discovery.restart();
+        }
+      }
+    } catch (error) {
+      if (mounted) _showMessage(_hotspot.errorMessage ?? error.toString());
+    }
+  }
+
+  Future<void> _copyHotspotCredentials() async {
+    final ssid = _hotspot.ssid;
+    if (ssid == null) return;
+    final passphrase = _hotspot.passphrase;
+    final credentials = passphrase == null
+        ? 'اسم الشبكة: $ssid'
+        : 'اسم الشبكة: $ssid\nكلمة المرور: $passphrase';
+    try {
+      await Clipboard.setData(ClipboardData(text: credentials));
+      if (mounted) _showMessage('تم نسخ بيانات نقطة الاتصال.');
+    } catch (error) {
+      if (mounted) _showMessage('تعذّر نسخ بيانات الاتصال: $error');
+    }
   }
 
   Future<void> _pickFilesAndSend({DiscoveredDevice? device}) async {
@@ -243,6 +277,20 @@ class _HomeScreenState extends State<HomeScreen> {
                             }
                           },
                         ),
+                        const SizedBox(height: 20),
+                        AnimatedBuilder(
+                          animation: _hotspot,
+                          builder: (context, _) => _LocalHotspotPanel(
+                            isAndroid: Platform.isAndroid,
+                            isWindows: Platform.isWindows,
+                            isActive: _hotspot.isActive,
+                            isBusy: _hotspot.isBusy,
+                            ssid: _hotspot.ssid,
+                            passphrase: _hotspot.passphrase,
+                            onToggle: () => unawaited(_toggleHotspot()),
+                            onCopy: () => unawaited(_copyHotspotCredentials()),
+                          ),
+                        ),
                         const SizedBox(height: 24),
                         if (isWide)
                           Row(
@@ -423,6 +471,166 @@ class _PageHeading extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+class _LocalHotspotPanel extends StatelessWidget {
+  const _LocalHotspotPanel({
+    required this.isAndroid,
+    required this.isWindows,
+    required this.isActive,
+    required this.isBusy,
+    required this.ssid,
+    required this.passphrase,
+    required this.onToggle,
+    required this.onCopy,
+  });
+
+  final bool isAndroid;
+  final bool isWindows;
+  final bool isActive;
+  final bool isBusy;
+  final String? ssid;
+  final String? passphrase;
+  final VoidCallback onToggle;
+  final VoidCallback onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    return _Panel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const _SectionIcon(
+                icon: Icons.wifi_tethering_rounded,
+                background: AppColors.blueTint,
+                foreground: AppColors.brandDark,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'اتصال مباشر بدون راوتر',
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'انقل الملفات عبر شبكة محلية مباشرة، بدون إنترنت.',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          if (isAndroid) ...[
+            if (isActive) ...[
+              SelectionArea(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _HotspotCredential(label: 'اسم الشبكة', value: ssid ?? ''),
+                    if (passphrase != null)
+                      _HotspotCredential(
+                        label: 'كلمة المرور',
+                        value: passphrase!,
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: onCopy,
+                    icon: const Icon(Icons.copy_rounded, size: 18),
+                    label: const Text('نسخ بيانات الاتصال'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: isBusy ? null : onToggle,
+                    icon: const Icon(Icons.stop_circle_outlined, size: 18),
+                    label: const Text('إيقاف نقطة الاتصال'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'من الجهاز الآخر، اتصل بهذه الشبكة من إعدادات Wi-Fi ثم اترك وصلة مفتوحًا على الجهازين.',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+            ] else ...[
+              Text(
+                'أنشئ نقطة اتصال محلية مؤقتة من هاتف Android، ثم صِل الكمبيوتر أو الهاتف الآخر بها. لا تستهلك بيانات الإنترنت.',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: isBusy ? null : onToggle,
+                icon: isBusy
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Icon(Icons.wifi_tethering_rounded, size: 19),
+                label: Text(
+                  isBusy ? 'جارٍ إنشاء نقطة الاتصال...' : 'إنشاء نقطة اتصال',
+                ),
+              ),
+            ],
+          ] else if (isWindows) ...[
+            Text(
+              'للاتصال المباشر بهاتف Android، افتح إعدادات Windows ثم '
+              'Network & Internet > Mobile hotspot وفعّل نقطة الاتصال إذا '
+              'كان محول Wi-Fi يدعم ذلك. بعد ذلك، صِل الهاتف بشبكة Windows '
+              'مع إبقاء التطبيق مفتوحًا على الجهازين.',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ] else ...[
+            Text(
+              'ابدأ نقطة الاتصال من هاتف Android، ثم صِل هذا الجهاز بها من إعدادات Wi-Fi.',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _HotspotCredential extends StatelessWidget {
+  const _HotspotCredential({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        children: [
+          Text('$label: ', style: Theme.of(context).textTheme.bodyMedium),
+          Flexible(
+            child: SelectableText(
+              value,
+              style: Theme.of(context).textTheme.bodyLarge
+                  ?.copyWith(fontWeight: FontWeight.w700),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
