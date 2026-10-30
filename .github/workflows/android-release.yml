@@ -1,4 +1,4 @@
-name: Android release
+name: Windows release
 
 on:
   push:
@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  build-and-publish:
-    runs-on: ubuntu-latest
+  build-windows:
+    runs-on: windows-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -21,10 +21,34 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Build Android APK
+      - name: Build Windows application
         run: |
           flutter pub get
-          flutter build apk --release
+          flutter build windows --release
+
+      - name: Package Windows application
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "build/windows/x64/runner/Release/*" `
+            -DestinationPath "Wasla-Windows-x64.zip" `
+            -CompressionLevel Optimal
+
+      - name: Upload Windows ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: Wasla-Windows-x64.zip
+
+  publish-windows:
+    runs-on: ubuntu-latest
+    needs: build-windows
+    steps:
+      - name: Download Windows ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: windows-release
 
       - name: Create release if needed
         env:
@@ -33,10 +57,10 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
             gh release create "$GITHUB_REF_NAME" --generate-notes
 
-      - name: Upload APK to release
+      - name: Upload release downloads
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "$GITHUB_REF_NAME" \
-            "build/app/outputs/flutter-apk/app-release.apk#Wasla-Android.apk" \
+            "windows-release/Wasla-Windows-x64.zip" \
             --clobber
