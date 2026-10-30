@@ -15,9 +15,11 @@ class DeviceDiscoveryController extends ChangeNotifier {
   static const serviceType = '_wasla._tcp';
 
   static const advertisedPort = 53317;
+  static const _resolutionTimeout = Duration(seconds: 5);
 
   final String _deviceId = _createDeviceId();
   final Map<String, DiscoveredDevice> _devices = {};
+  final Map<String, Timer> _resolutionTimers = {};
 
   BonsoirDiscovery? _discovery;
   BonsoirBroadcast? _broadcast;
@@ -38,6 +40,10 @@ class DeviceDiscoveryController extends ChangeNotifier {
 
     _status = DeviceDiscoveryStatus.starting;
     _errorMessage = null;
+    for (final timer in _resolutionTimers.values) {
+      timer.cancel();
+    }
+    _resolutionTimers.clear();
     _devices.clear();
     _notifyListeners();
 
@@ -64,6 +70,7 @@ class DeviceDiscoveryController extends ChangeNotifier {
         type: serviceType,
         port: advertisedPort,
         attributes: {
+          'devname': Platform.localHostname,
           'deviceid': _deviceId,
           'platform': Platform.operatingSystem,
           'protocolversion': '1',
@@ -102,24 +109,43 @@ class DeviceDiscoveryController extends ChangeNotifier {
           final service = event.service;
           if (_isOwnService(service)) return;
           _upsertDevice(service, isResolved: false);
-          service.resolve(_discovery!.serviceResolver);
+          final discovery = _discovery;
+          if (discovery != null) {
+            unawaited(
+              service.resolve(discovery.serviceResolver).catchError((
+                Object error,
+                StackTrace stackTrace,
+              ) {
+                _reportError(
+                  error,
+                  stackTrace,
+                  'Could not resolve ${service.name}.',
+                );
+                _markResolutionFailed(_deviceKey(service));
+              }),
+            );
+          }
           break;
         case BonsoirDiscoveryServiceResolvedEvent():
           final service = event.service;
           if (_isOwnService(service)) return;
-          _upsertDevice(service, isResolved: true);
+          _upsertDevice(service, isResolved: service.hostAddresses.isNotEmpty);
+          break;
+        case BonsoirDiscoveryServiceResolveFailedEvent():
+          for (final key in _devices.keys.toList()) {
+            _markResolutionFailed(key);
+          }
           break;
         case BonsoirDiscoveryServiceUpdatedEvent():
           final service = event.service;
           if (_isOwnService(service)) return;
-          _upsertDevice(
-            service,
-            isResolved: service.hostAddresses.isNotEmpty,
-          );
+          _upsertDevice(service, isResolved: service.hostAddresses.isNotEmpty);
           break;
         case BonsoirDiscoveryServiceLostEvent():
           final service = event.service;
-          _devices.remove(_deviceKey(service));
+          final key = _deviceKey(service);
+          _devices.remove(key);
+          _resolutionTimers.remove(key)?.cancel();
           _notifyListeners();
           break;
         default:
@@ -135,13 +161,49 @@ class DeviceDiscoveryController extends ChangeNotifier {
 
   void _upsertDevice(BonsoirService service, {required bool isResolved}) {
     final key = _deviceKey(service);
+    final previous = _devices[key];
+    final addresses = List<String>.unmodifiable(service.hostAddresses);
+    final hostname = service.hostname?.trim();
+    final hasHostname = hostname != null && hostname.isNotEmpty;
+    if (addresses.isNotEmpty || hasHostname) {
+      _resolutionTimers.remove(key)?.cancel();
+    } else if (previous?.resolutionFailed != true) {
+      _scheduleResolutionTimeout(key);
+    }
     _devices[key] = DiscoveredDevice(
       id: service.attributes['deviceid'] ?? key,
       platform: service.attributes['platform'] ?? 'unknown',
-      addresses: List.unmodifiable(service.hostAddresses),
-      port: service.port,
+      name: service.attributes['devname']?.trim() ?? '',
+      hostname: hasHostname ? hostname : null,
+      addresses: addresses,
+      port: service.port > 0 ? service.port : advertisedPort,
       isResolved: isResolved,
+      resolutionFailed:
+          previous?.resolutionFailed == true &&
+          addresses.isEmpty &&
+          !hasHostname,
     );
+    _notifyListeners();
+  }
+
+  void _scheduleResolutionTimeout(String key) {
+    if (_resolutionTimers.containsKey(key)) return;
+    _resolutionTimers[key] = Timer(_resolutionTimeout, () {
+      _resolutionTimers.remove(key);
+      _markResolutionFailed(key);
+    });
+  }
+
+  void _markResolutionFailed(String key) {
+    _resolutionTimers.remove(key)?.cancel();
+    final device = _devices[key];
+    if (device == null ||
+        device.canConnect ||
+        device.resolutionFailed ||
+        _disposed) {
+      return;
+    }
+    _devices[key] = device.copyWith(resolutionFailed: true);
     _notifyListeners();
   }
 
@@ -149,13 +211,22 @@ class DeviceDiscoveryController extends ChangeNotifier {
       service.attributes['deviceid'] ?? service.name;
 
   Future<void> _stopActions() async {
+    for (final timer in _resolutionTimers.values) {
+      timer.cancel();
+    }
+    _resolutionTimers.clear();
+
     final subscription = _eventSubscription;
     _eventSubscription = null;
     if (subscription != null) {
       try {
         await subscription.cancel();
       } catch (error, stackTrace) {
-        _reportError(error, stackTrace, 'Could not stop the discovery listener.');
+        _reportError(
+          error,
+          stackTrace,
+          'Could not stop the discovery listener.',
+        );
       }
     }
 

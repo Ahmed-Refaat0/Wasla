@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../../devices/domain/discovered_device.dart';
+import 'android_download_publisher.dart';
 import '../domain/transfer_file_source.dart';
 import '../domain/transfer_snapshot.dart';
 
@@ -22,15 +23,22 @@ class LocalTransferService extends ChangeNotifier {
     int? serverPort,
     Future<Directory?> Function()? downloadsDirectoryProvider,
     Future<Directory> Function()? documentsDirectoryProvider,
+    AndroidDownloadPublisher? androidDownloadPublisher,
+    bool Function()? isAndroid,
   }) : _serverPort = serverPort ?? port,
        _downloadsDirectoryProvider =
            downloadsDirectoryProvider ?? getDownloadsDirectory,
        _documentsDirectoryProvider =
-           documentsDirectoryProvider ?? getApplicationDocumentsDirectory;
+           documentsDirectoryProvider ?? getApplicationDocumentsDirectory,
+       _androidDownloadPublisher =
+           androidDownloadPublisher ?? AndroidDownloadPublisher(),
+       _isAndroid = isAndroid ?? (() => Platform.isAndroid);
 
   final int _serverPort;
   final Future<Directory?> Function() _downloadsDirectoryProvider;
   final Future<Directory> Function() _documentsDirectoryProvider;
+  final AndroidDownloadPublisher _androidDownloadPublisher;
+  final bool Function() _isAndroid;
   final Map<String, _TransferRecord> _records = {};
   final Set<String> _reservedDestinations = {};
   HttpServer? _server;
@@ -105,11 +113,11 @@ class LocalTransferService extends ChangeNotifier {
     if (!isRunning) {
       throw StateError('The local file receiver is not running.');
     }
-    if (!device.isResolved || device.addresses.isEmpty) {
+    if (!device.canConnect) {
       throw StateError('The selected device has no resolved network address.');
     }
 
-    final address = _selectAddress(device.addresses);
+    final address = _selectAddress(device);
     for (final source in sources) {
       await _sendFile(source, device, address);
     }
@@ -126,7 +134,7 @@ class LocalTransferService extends ChangeNotifier {
       direction: TransferDirection.outgoing,
       status: TransferStatus.requesting,
       totalBytes: source.size,
-      peerName: device.platform,
+      peerName: device.name.isEmpty ? device.platform : device.name,
     );
     if (record.totalBytes > maxFileSizeBytes) {
       record
@@ -496,22 +504,35 @@ class LocalTransferService extends ChangeNotifier {
         );
       }
 
+      var savedPath = destination;
+      if (_isAndroid()) {
+        final published = await _androidDownloadPublisher.publish(
+          source: partialFile,
+          fileName: record.fileName,
+        );
+        record
+          ..fileName = published.fileName
+          ..savedPath = published.path;
+        savedPath = published.path;
+        _reservedDestinations.remove(destination);
+        try {
+          await partialFile.delete();
+        } on FileSystemException catch (cleanupError, cleanupStackTrace) {
+          _reportError(
+            cleanupError,
+            cleanupStackTrace,
+            'Could not remove the temporary file after publishing its download.',
+          );
+        }
+      }
       record
         ..status = TransferStatus.completed
-        ..savedPath = destination;
+        ..savedPath = savedPath;
       _reservedDestinations.remove(destination);
       _notifyListeners();
       await _writeJson(request.response, HttpStatus.created, {'saved': true});
       _trimRecords();
     } catch (error, stackTrace) {
-      if (record.status == TransferStatus.completed) {
-        _reportError(
-          error,
-          stackTrace,
-          'Could not acknowledge the completed upload.',
-        );
-        return;
-      }
       try {
         await sink?.close();
       } on FileSystemException catch (closeError, closeStackTrace) {
@@ -552,7 +573,18 @@ class LocalTransferService extends ChangeNotifier {
 
   Future<String> _ensureSaveDirectory() async {
     final cached = _saveDirectory;
-    if (cached != null) return cached;
+    if (cached != null && !_isAndroid()) return cached;
+
+    if (_isAndroid()) {
+      final documentsDirectory = await _documentsDirectoryProvider();
+      final stagingDirectory = Directory(
+        '${documentsDirectory.path}${Platform.pathSeparator}Wasla'
+        '${Platform.pathSeparator}.incoming',
+      );
+      await stagingDirectory.create(recursive: true);
+      _saveDirectory = 'Downloads${Platform.pathSeparator}Wasla';
+      return stagingDirectory.path;
+    }
 
     Directory? directory;
     try {
@@ -634,8 +666,8 @@ class LocalTransferService extends ChangeNotifier {
     await response.close();
   }
 
-  String _selectAddress(List<String> addresses) {
-    final parsed = addresses
+  String _selectAddress(DiscoveredDevice device) {
+    final parsed = device.addresses
         .map((address) => InternetAddress.tryParse(address))
         .whereType<InternetAddress>()
         .toList();
@@ -646,6 +678,12 @@ class LocalTransferService extends ChangeNotifier {
       if (address.type == InternetAddressType.IPv6 && !address.isLinkLocal) {
         return address.address;
       }
+    }
+    final hostname = device.hostname?.trim();
+    if (hostname != null && hostname.isNotEmpty) {
+      return hostname.endsWith('.')
+          ? hostname.substring(0, hostname.length - 1)
+          : hostname;
     }
     throw const SocketException('No usable network address was discovered.');
   }
@@ -749,7 +787,7 @@ class _TransferRecord {
   });
 
   final String id;
-  final String fileName;
+  String fileName;
   final TransferDirection direction;
   final int totalBytes;
   final String peerName;

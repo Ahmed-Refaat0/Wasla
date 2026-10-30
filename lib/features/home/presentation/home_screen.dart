@@ -21,10 +21,15 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
+enum _HomeMode { send, receive }
+
 class _HomeScreenState extends State<HomeScreen> {
   final LocalHotspotController _hotspot = LocalHotspotController();
   final DeviceDiscoveryController _discovery = DeviceDiscoveryController();
   final LocalTransferService _transfers = LocalTransferService();
+  final TextEditingController _manualAddressController =
+      TextEditingController();
+  _HomeMode _mode = _HomeMode.send;
 
   @override
   void initState() {
@@ -48,6 +53,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _manualAddressController.dispose();
     _hotspot.dispose();
     _discovery.dispose();
     _transfers.dispose();
@@ -167,15 +173,102 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<DiscoveredDevice?> _promptForAddress() async {
+    _manualAddressController.clear();
+    return showDialog<DiscoveredDevice>(
+      context: context,
+      builder: (dialogContext) {
+        String? validationMessage;
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            void submitAddress() {
+              final input = _manualAddressController.text.trim();
+              final address = InternetAddress.tryParse(input);
+              if (address == null) {
+                setDialogState(() {
+                  validationMessage = 'أدخل عنوان IPv4 أو IPv6 صالحًا.';
+                });
+                return;
+              }
+              Navigator.pop(
+                dialogContext,
+                DiscoveredDevice(
+                  id: 'manual-${address.address}',
+                  platform: 'unknown',
+                  name: address.address,
+                  addresses: [address.address],
+                  port: LocalTransferService.port,
+                  isResolved: true,
+                ),
+              );
+            }
+
+            return AlertDialog(
+              title: const Text('الاتصال بعنوان IP'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'أدخل عنوان IP للجهاز المستلم على الشبكة المحلية.',
+                  ),
+                  const SizedBox(height: 14),
+                  Directionality(
+                    textDirection: TextDirection.ltr,
+                    child: TextField(
+                      controller: _manualAddressController,
+                      autofocus: true,
+                      keyboardType: TextInputType.url,
+                      decoration: InputDecoration(
+                        labelText: 'مثال: 192.168.1.25',
+                        errorText: validationMessage,
+                        border: const OutlineInputBorder(),
+                      ),
+                      onSubmitted: (_) => submitAddress(),
+                    ),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('إلغاء'),
+                ),
+                FilledButton(
+                  onPressed: submitAddress,
+                  child: const Text('متابعة'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _sendToManualAddress() async {
+    final device = await _promptForAddress();
+    if (device != null && mounted) {
+      await _pickFilesAndSend(device: device);
+    }
+  }
+
+  Future<void> _sendToDevice(DiscoveredDevice device) async {
+    if (!device.canConnect) {
+      final manualDevice = await _promptForAddress();
+      if (manualDevice == null || !mounted) return;
+      await _pickFilesAndSend(device: manualDevice);
+      return;
+    }
+    await _pickFilesAndSend(device: device);
+  }
+
   Future<DiscoveredDevice?> _chooseDevice() {
     final availableDevices = _discovery.devices
-        .where((device) => device.isResolved && device.addresses.isNotEmpty)
+        .where((device) => device.canConnect)
         .toList();
     if (availableDevices.isEmpty) {
-      _showMessage(
-        'لا توجد أجهزة جاهزة للإرسال. تأكد من اتصالها بالشبكة نفسها.',
-      );
-      return Future.value(null);
+      return _promptForAddress();
     }
     if (availableDevices.length == 1) {
       return Future.value(availableDevices.single);
@@ -199,8 +292,12 @@ class _HomeScreenState extends State<HomeScreen> {
             for (final device in availableDevices)
               ListTile(
                 leading: const Icon(Icons.devices_rounded),
-                title: Text(_platformLabel(device.platform)),
-                subtitle: Text(device.id),
+                title: Text(
+                  device.name.isEmpty
+                      ? _platformLabel(device.platform)
+                      : device.name,
+                ),
+                subtitle: Text(_platformLabel(device.platform)),
                 onTap: () => Navigator.pop(context, device),
               ),
           ],
@@ -292,56 +389,94 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         ),
                         const SizedBox(height: 24),
-                        if (isWide)
-                          Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Expanded(
-                                flex: 11,
-                                child: _DevicesPanel(
-                                  devices: _discovery.devices,
-                                  status: _discovery.status,
-                                  errorMessage: _discovery.errorMessage,
-                                  onRetry: () =>
-                                      unawaited(_discovery.restart()),
-                                  onDeviceSelected: (device) => unawaited(
-                                    _pickFilesAndSend(device: device),
+                        AnimatedBuilder(
+                          animation: _transfers,
+                          builder: (context, _) => _TransferModeSelector(
+                            mode: _mode,
+                            pendingIncomingCount: _transfers.transfers
+                                .where((transfer) => transfer.needsApproval)
+                                .length,
+                            onChanged: (mode) => setState(() => _mode = mode),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        if (_mode == _HomeMode.send) ...[
+                          if (isWide)
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(
+                                  flex: 11,
+                                  child: _DevicesPanel(
+                                    devices: _discovery.devices,
+                                    status: _discovery.status,
+                                    errorMessage: _discovery.errorMessage,
+                                    onRetry: () =>
+                                        unawaited(_discovery.restart()),
+                                    onManualConnect: () =>
+                                        unawaited(_sendToManualAddress()),
+                                    onDeviceSelected: (device) =>
+                                        unawaited(_sendToDevice(device)),
                                   ),
                                 ),
-                              ),
-                              const SizedBox(width: 20),
-                              Expanded(
-                                flex: 9,
-                                child: _SendPanel(
-                                  onChooseFiles: () =>
-                                      unawaited(_pickFilesAndSend()),
-                                  onFilesDropped: _sendDroppedItems,
+                                const SizedBox(width: 20),
+                                Expanded(
+                                  flex: 9,
+                                  child: _SendPanel(
+                                    onChooseFiles: () =>
+                                        unawaited(_pickFilesAndSend()),
+                                    onFilesDropped: _sendDroppedItems,
+                                  ),
                                 ),
-                              ),
-                            ],
-                          )
-                        else ...[
-                          _DevicesPanel(
-                            devices: _discovery.devices,
-                            status: _discovery.status,
-                            errorMessage: _discovery.errorMessage,
-                            onRetry: () => unawaited(_discovery.restart()),
-                            onDeviceSelected: (device) =>
-                                unawaited(_pickFilesAndSend(device: device)),
-                          ),
-                          const SizedBox(height: 16),
-                          _SendPanel(
-                            onChooseFiles: () => unawaited(_pickFilesAndSend()),
-                            onFilesDropped: _sendDroppedItems,
+                              ],
+                            )
+                          else ...[
+                            _DevicesPanel(
+                              devices: _discovery.devices,
+                              status: _discovery.status,
+                              errorMessage: _discovery.errorMessage,
+                              onRetry: () => unawaited(_discovery.restart()),
+                              onManualConnect: () =>
+                                  unawaited(_sendToManualAddress()),
+                              onDeviceSelected: (device) =>
+                                  unawaited(_sendToDevice(device)),
+                            ),
+                            const SizedBox(height: 16),
+                            _SendPanel(
+                              onChooseFiles: () =>
+                                  unawaited(_pickFilesAndSend()),
+                              onFilesDropped: _sendDroppedItems,
+                            ),
+                          ],
+                        ] else ...[
+                          AnimatedBuilder(
+                            animation: _transfers,
+                            builder: (context, _) => _ReceiveReadyPanel(
+                              isRunning: _transfers.isRunning,
+                              saveDirectory: _transfers.saveDirectory,
+                              serverError: _transfers.serverError,
+                              onRetry: () => unawaited(_retryLocalServices()),
+                            ),
                           ),
                         ],
                         const SizedBox(height: 20),
                         AnimatedBuilder(
                           animation: _transfers,
                           builder: (context, _) => _TransfersPanel(
-                            transfers: _transfers.transfers,
-                            serverError: _transfers.serverError,
-                            saveDirectory: _transfers.saveDirectory,
+                            transfers: _transfers.transfers
+                                .where(
+                                  (transfer) =>
+                                      transfer.direction ==
+                                      (_mode == _HomeMode.send
+                                          ? TransferDirection.outgoing
+                                          : TransferDirection.incoming),
+                                )
+                                .toList(),
+                            title: _mode == _HomeMode.send
+                                ? 'الملفات المرسلة'
+                                : 'الملفات المستلمة',
+                            serverError: null,
+                            saveDirectory: null,
                             onAccept: _transfers.accept,
                             onReject: _transfers.reject,
                             onRetryServer: () =>
@@ -668,12 +803,213 @@ class _SearchButton extends StatelessWidget {
   }
 }
 
+class _TransferModeSelector extends StatelessWidget {
+  const _TransferModeSelector({
+    required this.mode,
+    required this.pendingIncomingCount,
+    required this.onChanged,
+  });
+
+  final _HomeMode mode;
+  final int pendingIncomingCount;
+  final ValueChanged<_HomeMode> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(5),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.line),
+      ),
+      child: Row(
+        children: [
+          _ModeButton(
+            label: 'إرسال',
+            icon: Icons.upload_rounded,
+            selected: mode == _HomeMode.send,
+            badgeCount: 0,
+            onTap: () => onChanged(_HomeMode.send),
+          ),
+          const SizedBox(width: 6),
+          _ModeButton(
+            label: 'استقبال',
+            icon: Icons.download_rounded,
+            selected: mode == _HomeMode.receive,
+            badgeCount: pendingIncomingCount,
+            onTap: () => onChanged(_HomeMode.receive),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ModeButton extends StatelessWidget {
+  const _ModeButton({
+    required this.label,
+    required this.icon,
+    required this.selected,
+    required this.badgeCount,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final bool selected;
+  final int badgeCount;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Semantics(
+        button: true,
+        selected: selected,
+        child: Material(
+          color: selected ? AppColors.brand : Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: BorderRadius.circular(12),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 13),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    icon,
+                    size: 19,
+                    color: selected ? Colors.white : AppColors.muted,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    label,
+                    style: TextStyle(
+                      color: selected ? Colors.white : AppColors.ink,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  if (badgeCount > 0) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: selected ? Colors.white : AppColors.brand,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text(
+                        _arabicDigits(badgeCount),
+                        style: TextStyle(
+                          color: selected ? AppColors.brand : Colors.white,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ReceiveReadyPanel extends StatelessWidget {
+  const _ReceiveReadyPanel({
+    required this.isRunning,
+    required this.saveDirectory,
+    required this.serverError,
+    required this.onRetry,
+  });
+
+  final bool isRunning;
+  final String? saveDirectory;
+  final String? serverError;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return _Panel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const _SectionIcon(
+                icon: Icons.download_rounded,
+                background: AppColors.brandTint,
+                foreground: AppColors.brand,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      isRunning ? 'الاستقبال جاهز' : 'الاستقبال غير متاح',
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      isRunning
+                          ? 'اتصل بنفس شبكة Wi-Fi ووافق على طلب الإرسال عند ظهوره.'
+                          : 'تعذّر بدء خادم الاستقبال المحلي.',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                isRunning ? Icons.wifi_rounded : Icons.wifi_off_rounded,
+                color: isRunning ? AppColors.brand : Colors.deepOrange,
+              ),
+            ],
+          ),
+          if (saveDirectory != null) ...[
+            const SizedBox(height: 16),
+            _TransferNotice(
+              icon: Icons.folder_open_outlined,
+              color: AppColors.muted,
+              text: 'مكان حفظ الملفات: $saveDirectory',
+            ),
+          ],
+          if (!isRunning && serverError != null) ...[
+            const SizedBox(height: 12),
+            _TransferNotice(
+              icon: Icons.error_outline_rounded,
+              color: Colors.deepOrange,
+              text: serverError!,
+            ),
+            Align(
+              alignment: AlignmentDirectional.centerStart,
+              child: TextButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh_rounded, size: 17),
+                label: const Text('إعادة المحاولة'),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 class _DevicesPanel extends StatelessWidget {
   const _DevicesPanel({
     required this.devices,
     required this.status,
     required this.errorMessage,
     required this.onRetry,
+    required this.onManualConnect,
     required this.onDeviceSelected,
   });
 
@@ -681,6 +1017,7 @@ class _DevicesPanel extends StatelessWidget {
   final DeviceDiscoveryStatus status;
   final String? errorMessage;
   final VoidCallback onRetry;
+  final VoidCallback onManualConnect;
   final ValueChanged<DiscoveredDevice> onDeviceSelected;
 
   @override
@@ -754,15 +1091,22 @@ class _DevicesPanel extends StatelessWidget {
                       for (var index = 0; index < devices.length; index++) ...[
                         _DeviceTile(
                           device: devices[index],
-                          onTap: devices[index].isResolved
-                              ? () => onDeviceSelected(devices[index])
-                              : null,
+                          onTap: () => onDeviceSelected(devices[index]),
                         ),
                         if (index != devices.length - 1)
                           const Divider(height: 1, color: AppColors.line),
                       ],
                     ],
                   ),
+          ),
+          const SizedBox(height: 12),
+          Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: TextButton.icon(
+              onPressed: onManualConnect,
+              icon: const Icon(Icons.pin_drop_outlined, size: 18),
+              label: const Text('إدخال عنوان IP يدويًا'),
+            ),
           ),
         ],
       ),
@@ -898,23 +1242,29 @@ class _DeviceTile extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '$label · ${device.id.substring(0, device.id.length < 4 ? device.id.length : 4).toUpperCase()}',
+                      device.name.isNotEmpty
+                          ? device.name
+                          : '$label · ${device.id.substring(0, device.id.length < 4 ? device.id.length : 4).toUpperCase()}',
                       style: Theme.of(context).textTheme.titleMedium,
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      onTap == null
-                          ? 'جارٍ تحديد عنوان الجهاز...'
-                          : 'اضغط لاختيار الملفات وإرسالها',
+                      device.canConnect
+                          ? 'متاح للإرسال · ${_platformLabel(device.platform)}'
+                          : device.resolutionFailed
+                          ? 'تعذّر تحديد العنوان؛ أدخل IP يدويًا أو حاول لاحقًا'
+                          : 'جارٍ تحديد عنوان الجهاز...',
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
                   ],
                 ),
               ),
               Icon(
-                onTap == null ? Icons.radar_rounded : Icons.arrow_back_rounded,
+                device.canConnect
+                    ? Icons.arrow_back_rounded
+                    : Icons.edit_location_alt_outlined,
                 size: 19,
-                color: onTap == null ? AppColors.muted : AppColors.brand,
+                color: device.canConnect ? AppColors.brand : AppColors.muted,
               ),
             ],
           ),
@@ -1077,6 +1427,7 @@ class _SendPanelState extends State<_SendPanel> {
 class _TransfersPanel extends StatelessWidget {
   const _TransfersPanel({
     required this.transfers,
+    required this.title,
     required this.serverError,
     required this.saveDirectory,
     required this.onAccept,
@@ -1085,6 +1436,7 @@ class _TransfersPanel extends StatelessWidget {
   });
 
   final List<TransferSnapshot> transfers;
+  final String title;
   final String? serverError;
   final String? saveDirectory;
   final ValueChanged<String> onAccept;
@@ -1110,10 +1462,7 @@ class _TransfersPanel extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      'عمليات النقل',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
+                    Text(title, style: Theme.of(context).textTheme.titleMedium),
                     const SizedBox(height: 2),
                     Text(
                       transfers.isEmpty
@@ -1194,7 +1543,9 @@ class _TransferRow extends StatelessWidget {
         'يريد ${_platformLabel(transfer.peerName)} إرسال ملف إليك',
       TransferStatus.waitingForUpload => 'تمت الموافقة؛ جارٍ انتظار الملف...',
       TransferStatus.transferring =>
-        '${transfer.progress.toStringAsFixed(0)}٪ · ${_formatSpeed(transfer.bytesPerSecond)}',
+        '${_formatBytes(transfer.transferredBytes)} / ${_formatBytes(transfer.totalBytes)} · '
+            '${(transfer.progress * 100).toStringAsFixed(1)}٪ · '
+            '${_formatSpeed(transfer.bytesPerSecond)}',
       TransferStatus.completed =>
         incoming ? 'اكتمل الاستقبال' : 'اكتمل الإرسال',
       TransferStatus.rejected => 'تم رفض الاستقبال',

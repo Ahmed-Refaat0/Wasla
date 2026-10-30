@@ -5,24 +5,46 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
+import android.content.ContentValues
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.io.IOException
+import java.net.URLConnection
+import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
     companion object {
         private const val HOTSPOT_CHANNEL = "wasla/local_hotspot"
+        private const val DOWNLOADS_CHANNEL = "wasla/downloads"
         private const val PERMISSION_REQUEST_CODE = 53317
+        private const val STORAGE_PERMISSION_REQUEST_CODE = 53318
+        private const val DOWNLOAD_RELATIVE_PATH = "Download/Wasla/"
+        private val downloadExecutor = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "WaslaDownloadPublisher").apply { isDaemon = true }
+        }
     }
 
     private lateinit var hotspotChannel: MethodChannel
+    private lateinit var downloadsChannel: MethodChannel
     private var hotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var permissionResult: MethodChannel.Result? = null
     private var hotspotResult: MethodChannel.Result? = null
+    private var storagePermissionResult: MethodChannel.Result? = null
+    private var pendingDownload: PendingDownload? = null
+
+    private data class PendingDownload(
+        val sourcePath: String,
+        val fileName: String,
+        val result: MethodChannel.Result,
+    )
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -34,6 +56,16 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
                 "start" -> startHotspot(result)
                 "stop" -> stopHotspot(result)
+                else -> result.notImplemented()
+            }
+        }
+        downloadsChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            DOWNLOADS_CHANNEL,
+        )
+        downloadsChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "publishDownload" -> publishDownload(call, result)
                 else -> result.notImplemented()
             }
         }
@@ -83,21 +115,242 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != PERMISSION_REQUEST_CODE) return
+        when (requestCode) {
+            PERMISSION_REQUEST_CODE -> {
+                val result = permissionResult ?: return
+                permissionResult = null
+                if (grantResults.isNotEmpty() &&
+                    grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+                ) {
+                    requestLocalOnlyHotspot(result)
+                } else {
+                    result.error(
+                        "permission_denied",
+                        "اسمح بالإذن المطلوب لإنشاء نقطة الاتصال المحلية.",
+                        null,
+                    )
+                }
+            }
 
-        val result = permissionResult ?: return
-        permissionResult = null
-        if (grantResults.isNotEmpty() &&
-            grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+            STORAGE_PERMISSION_REQUEST_CODE -> {
+                val result = storagePermissionResult ?: return
+                storagePermissionResult = null
+                val pending = pendingDownload
+                pendingDownload = null
+                if (grantResults.isNotEmpty() &&
+                    grantResults.all { it == PackageManager.PERMISSION_GRANTED } &&
+                    pending != null
+                ) {
+                    publishLegacyDownload(pending)
+                } else {
+                    result.error(
+                        "storage_permission_denied",
+                        "اسمح بحفظ الملفات في مجلد التنزيلات.",
+                        null,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun publishDownload(
+        call: io.flutter.plugin.common.MethodCall,
+        result: MethodChannel.Result,
+    ) {
+        val sourcePath = call.argument<String>("sourcePath")
+        val fileName = call.argument<String>("fileName")
+        if (sourcePath.isNullOrBlank() ||
+            fileName.isNullOrBlank() ||
+            fileName != File(fileName).name
         ) {
-            requestLocalOnlyHotspot(result)
+            result.error("invalid_download", "بيانات الملف غير صالحة.", null)
+            return
+        }
+        if (pendingDownload != null || storagePermissionResult != null) {
+            result.error("busy", "جارٍ حفظ ملف آخر في مجلد التنزيلات.", null)
+            return
+        }
+
+        val pending = PendingDownload(sourcePath, fileName, result)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingDownload = pending
+            storagePermissionResult = result
+            requestPermissions(
+                arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                STORAGE_PERMISSION_REQUEST_CODE,
+            )
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            publishMediaStoreDownload(pending)
         } else {
-            result.error(
-                "permission_denied",
-                "اسمح بالإذن المطلوب لإنشاء نقطة الاتصال المحلية.",
-                null,
+            publishLegacyDownload(pending)
+        }
+    }
+
+    private fun publishMediaStoreDownload(pending: PendingDownload) {
+        runDownloadOperation(pending) {
+            val source = checkedSourceFile(pending.sourcePath)
+            publishToMediaStore(source, pending.fileName)
+        }
+    }
+
+    private fun runDownloadOperation(
+        pending: PendingDownload,
+        operation: () -> Map<String, String>,
+    ) {
+        downloadExecutor.execute {
+            try {
+                val savedFile = operation()
+                runOnUiThread { pending.result.success(savedFile) }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    pending.result.error(
+                        "download_save_failed",
+                        error.message ?: "تعذّر حفظ الملف في مجلد التنزيلات.",
+                        null,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun checkedSourceFile(path: String): File {
+        val file = File(path)
+        if (!file.isFile || !file.canRead()) {
+            throw IOException("ملف الاستقبال المؤقت غير متاح للقراءة.")
+        }
+        return file
+    }
+
+    private fun publishToMediaStore(
+        source: File,
+        requestedName: String,
+    ): Map<String, String> {
+        val collection = MediaStore.Downloads.getContentUri(
+            MediaStore.VOLUME_EXTERNAL_PRIMARY,
+        )
+        val resolver = contentResolver
+        val mimeType =
+            URLConnection.guessContentTypeFromName(requestedName)
+                ?: "application/octet-stream"
+        var savedName: String? = null
+        var savedUri: android.net.Uri? = null
+        for (index in 0 until 10_000) {
+            val candidate = uniqueDownloadName(requestedName, index)
+            if (downloadExists(collection, candidate)) continue
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, candidate)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    DOWNLOAD_RELATIVE_PATH,
+                )
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            savedUri = resolver.insert(collection, values)
+                ?: throw IOException("تعذّر إنشاء الملف في مجلد التنزيلات.")
+            savedName = candidate
+            break
+        }
+        val uri = savedUri
+            ?: throw IOException("تعذّر العثور على اسم متاح في مجلد التنزيلات.")
+
+        try {
+            val output = resolver.openOutputStream(uri, "w")
+                ?: throw IOException("تعذّر فتح الملف في مجلد التنزيلات.")
+            source.inputStream().buffered().use { input ->
+                output.buffered().use { destination ->
+                    input.copyTo(destination, 256 * 1024)
+                }
+            }
+            val publishedValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            if (resolver.update(uri, publishedValues, null, null) != 1) {
+                throw IOException("تعذّر إظهار الملف في مجلد التنزيلات.")
+            }
+        } catch (error: Exception) {
+            resolver.delete(uri, null, null)
+            throw error
+        }
+
+        val name = savedName
+            ?: throw IOException("تعذّر تأكيد اسم الملف المحفوظ.")
+        return mapOf(
+            "path" to "Downloads/Wasla/$name",
+            "fileName" to name,
+        )
+    }
+
+    private fun downloadExists(collection: android.net.Uri, name: String): Boolean {
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
+        val selection =
+            "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND " +
+                "${MediaStore.MediaColumns.RELATIVE_PATH} = ?"
+        return contentResolver.query(
+            collection,
+            projection,
+            selection,
+            arrayOf(name, DOWNLOAD_RELATIVE_PATH),
+            null,
+        )?.use { cursor -> cursor.moveToFirst() } ?: false
+    }
+
+    private fun publishLegacyDownload(pending: PendingDownload) {
+        runDownloadOperation(pending) {
+            val source = checkedSourceFile(pending.sourcePath)
+            @Suppress("DEPRECATION")
+            val downloads = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOWNLOADS,
+            )
+            val targetDirectory = File(downloads, "Wasla")
+            if (!targetDirectory.exists() && !targetDirectory.mkdirs()) {
+                throw IOException("تعذّر إنشاء مجلد التنزيلات/Wasla.")
+            }
+            val destination = uniqueLegacyDestination(
+                targetDirectory,
+                pending.fileName,
+            )
+            try {
+                source.inputStream().buffered().use { input ->
+                    destination.outputStream().buffered().use { output ->
+                        input.copyTo(output, 256 * 1024)
+                    }
+                }
+            } catch (error: Exception) {
+                destination.delete()
+                throw error
+            }
+            mapOf(
+                "path" to "Downloads/Wasla/${destination.name}",
+                "fileName" to destination.name,
             )
         }
+    }
+
+    private fun uniqueLegacyDestination(directory: File, requestedName: String): File {
+        for (index in 0 until 10_000) {
+            val name = uniqueDownloadName(requestedName, index)
+            val candidate = File(directory, name)
+            if (candidate.createNewFile()) return candidate
+        }
+        throw IOException("تعذّر العثور على اسم متاح في مجلد التنزيلات.")
+    }
+
+    private fun uniqueDownloadName(name: String, index: Int): String {
+        if (index == 0) return name
+        val dot = name.lastIndexOf('.')
+        val hasExtension = dot > 0
+        val stem = if (hasExtension) name.substring(0, dot) else name
+        val extension = if (hasExtension) name.substring(dot) else ""
+        return "$stem ($index)$extension"
     }
 
     private fun requestLocalOnlyHotspot(result: MethodChannel.Result) {
@@ -191,6 +444,8 @@ class MainActivity : FlutterActivity() {
         hotspotReservation = null
         permissionResult = null
         hotspotResult = null
+        pendingDownload = null
+        storagePermissionResult = null
         super.onDestroy()
     }
 }
