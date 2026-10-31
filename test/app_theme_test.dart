@@ -5,6 +5,7 @@ import 'package:wasla/app/theme/app_theme.dart';
 void main() {
   tearDown(() {
     AppColors.isDarkMode = false;
+    AppColors.primaryColor = const Color(0xFF167D76);
   });
 
   test('dark theme uses dark surfaces and readable foregrounds', () {
@@ -25,5 +26,17 @@ void main() {
     expect(AppTheme.light.scaffoldBackgroundColor, AppColors.canvas);
     expect(AppColors.surface, Colors.white);
     expect(AppColors.brand, const Color(0xFF167D76));
+  });
+
+  test('custom accent color updates light and dark theme palettes', () {
+    const accent = Color(0xFF8757C6);
+    AppColors.primaryColor = accent;
+
+    expect(AppTheme.light.colorScheme.primary, accent);
+    expect(AppColors.brand, accent);
+
+    AppColors.isDarkMode = true;
+    expect(AppTheme.dark.colorScheme.primary, AppColors.brand);
+    expect(AppColors.brand, isNot(accent));
   });
 }

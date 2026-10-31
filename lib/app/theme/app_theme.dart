@@ -2,6 +2,14 @@ import 'package:flutter/material.dart';
 
 abstract final class AppColors {
   static bool isDarkMode = false;
+  static Color primaryColor = const Color(0xFF167D76);
+
+  static Color _brandFor(Color primary, bool dark) {
+    if (primary == const Color(0xFF167D76)) {
+      return dark ? const Color(0xFF64C9BE) : primary;
+    }
+    return dark ? Color.lerp(primary, Colors.white, 0.28)! : primary;
+  }
 
   static Color get canvas =>
       isDarkMode ? const Color(0xFF101719) : const Color(0xFFF5F8F9);
@@ -13,12 +21,26 @@ abstract final class AppColors {
       isDarkMode ? const Color(0xFFA3B2B5) : const Color(0xFF71818A);
   static Color get line =>
       isDarkMode ? const Color(0xFF2C3A3E) : const Color(0xFFE7EDEF);
-  static Color get brand =>
-      isDarkMode ? const Color(0xFF64C9BE) : const Color(0xFF167D76);
-  static Color get brandDark =>
-      isDarkMode ? const Color(0xFF91DDD4) : const Color(0xFF11645F);
-  static Color get brandTint =>
-      isDarkMode ? const Color(0xFF203936) : const Color(0xFFE9F5F3);
+  static Color get brand => _brandFor(primaryColor, isDarkMode);
+  static Color get brandDark {
+    if (primaryColor == const Color(0xFF167D76)) {
+      return isDarkMode ? const Color(0xFF91DDD4) : const Color(0xFF11645F);
+    }
+    return isDarkMode
+        ? Color.lerp(brand, Colors.white, 0.2)!
+        : _darken(primaryColor);
+  }
+
+  static Color get brandTint {
+    if (primaryColor == const Color(0xFF167D76)) {
+      return isDarkMode ? const Color(0xFF203936) : const Color(0xFFE9F5F3);
+    }
+    return Color.alphaBlend(
+      brand.withValues(alpha: isDarkMode ? 0.16 : 0.05),
+      canvas,
+    );
+  }
+
   static Color get blueTint =>
       isDarkMode ? const Color(0xFF252F48) : const Color(0xFFEEF3FF);
   static Color get blue =>
@@ -41,31 +63,39 @@ abstract final class AppColors {
       isDarkMode ? const Color(0xFF102322) : Colors.white;
   static Color get snackbar =>
       isDarkMode ? const Color(0xFF29383C) : const Color(0xFF172B36);
+
+  static Color _darken(Color color) => HSLColor.fromColor(color)
+      .withLightness(
+        (HSLColor.fromColor(color).lightness - 0.16).clamp(0.1, 0.9),
+      )
+      .toColor();
 }
 
 abstract final class AppTheme {
-  static ThemeData get light => _build(Brightness.light);
+  static ThemeData get light =>
+      _build(Brightness.light, AppColors.primaryColor);
 
-  static ThemeData get dark => _build(Brightness.dark);
+  static ThemeData get dark => _build(Brightness.dark, AppColors.primaryColor);
 
-  static ThemeData _build(Brightness brightness) {
+  static ThemeData _build(Brightness brightness, Color? primaryColor) {
     final isDark = brightness == Brightness.dark;
+    final seedColor = primaryColor ?? AppColors.primaryColor;
     final colors = isDark
-        ? const (
-            canvas: Color(0xFF101719),
-            surface: Color(0xFF1A2427),
-            ink: Color(0xFFE7F0F1),
-            muted: Color(0xFFA3B2B5),
-            line: Color(0xFF2C3A3E),
-            brand: Color(0xFF64C9BE),
+        ? (
+            canvas: const Color(0xFF101719),
+            surface: const Color(0xFF1A2427),
+            ink: const Color(0xFFE7F0F1),
+            muted: const Color(0xFFA3B2B5),
+            line: const Color(0xFF2C3A3E),
+            brand: AppColors._brandFor(seedColor, true),
           )
-        : const (
-            canvas: Color(0xFFF5F8F9),
+        : (
+            canvas: const Color(0xFFF5F8F9),
             surface: Colors.white,
-            ink: Color(0xFF172B36),
-            muted: Color(0xFF71818A),
-            line: Color(0xFFE7EDEF),
-            brand: Color(0xFF167D76),
+            ink: const Color(0xFF172B36),
+            muted: const Color(0xFF71818A),
+            line: const Color(0xFFE7EDEF),
+            brand: seedColor,
           );
     final colorScheme =
         ColorScheme.fromSeed(
