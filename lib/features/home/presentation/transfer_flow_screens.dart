@@ -190,10 +190,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
                   isError: true,
                 ),
               if (widget.discovery.devices.isEmpty)
-                _EmptyDevices(
-                  searching: widget.discovery.isSearching,
-                  onManualAddress: _addManualDevice,
-                )
+                _EmptyDevices(searching: widget.discovery.isSearching)
               else
                 ...widget.discovery.devices.map(
                   (device) => _DeviceChoice(
@@ -204,6 +201,20 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
                         : null,
                   ),
                 ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: _addManualDevice,
+                icon: const Icon(Icons.edit_location_alt_rounded),
+                label: const Text('الاتصال بعنوان IP'),
+              ),
+              if (_selectedDevice != null) ...[
+                const SizedBox(height: 8),
+                _InlineMessage(
+                  icon: Icons.check_circle_outline_rounded,
+                  message: 'الجهاز المحدد: ${_deviceName(_selectedDevice!)}',
+                  isError: false,
+                ),
+              ],
               if (_selectedDevice != null) ...[
                 const SizedBox(height: 18),
                 FilledButton.icon(
@@ -639,10 +650,9 @@ class _DeviceChoice extends StatelessWidget {
 }
 
 class _EmptyDevices extends StatelessWidget {
-  const _EmptyDevices({required this.searching, required this.onManualAddress});
+  const _EmptyDevices({required this.searching});
 
   final bool searching;
-  final VoidCallback onManualAddress;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -666,11 +676,6 @@ class _EmptyDevices extends StatelessWidget {
           searching
               ? 'جارٍ البحث عن أجهزة قريبة...'
               : 'لا توجد أجهزة قريبة حاليًا.',
-        ),
-        TextButton.icon(
-          onPressed: onManualAddress,
-          icon: const Icon(Icons.edit_location_alt_rounded),
-          label: const Text('أدخل عنوان IP يدويًا'),
         ),
       ],
     ),
