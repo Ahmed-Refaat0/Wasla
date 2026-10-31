@@ -76,6 +76,139 @@ void main() {
       await File(completedIncoming.savedPath!).readAsString(),
       'Wasla streams this file.',
     );
+    receiver.removeTransfer(completedIncoming.id);
+    expect(receiver.transfers, isEmpty);
+  });
+
+  test('shows local addresses for manual device pairing', () async {
+    final service = LocalTransferService(
+      serverPort: 0,
+      localAddressesProvider: () async => ['192.168.10.4', '10.0.0.12'],
+    );
+    addTearDown(service.dispose);
+
+    await service.start();
+
+    expect(service.localAddresses, ['192.168.10.4', '10.0.0.12']);
+  });
+
+  test('cancels a transfer while waiting for receiver approval', () async {
+    final temporaryDirectory = await Directory.systemTemp.createTemp(
+      'wasla-cancel-offer-test-',
+    );
+    addTearDown(() async {
+      if (await temporaryDirectory.exists()) {
+        await temporaryDirectory.delete(recursive: true);
+      }
+    });
+
+    final sender = LocalTransferService(serverPort: 0);
+    final receiver = LocalTransferService(serverPort: 0);
+    addTearDown(sender.dispose);
+    addTearDown(receiver.dispose);
+    await sender.start();
+    await receiver.start();
+
+    final target = DiscoveredDevice(
+      id: 'cancel-approval-device',
+      platform: 'test',
+      addresses: const ['127.0.0.1'],
+      port: receiver.listeningPort,
+      isResolved: true,
+    );
+    final sendFuture = sender.sendSources([
+      TransferFileSource(
+        name: 'approval.txt',
+        size: 5,
+        openRead: () => Stream.value('hello'.codeUnits),
+      ),
+    ], target);
+
+    await _waitUntil(
+      () => receiver.transfers.any((transfer) => transfer.needsApproval),
+    );
+    final outgoing = sender.transfers.single;
+    await sender
+        .cancelTransfer(outgoing.id)
+        .timeout(const Duration(seconds: 5));
+    await sendFuture.timeout(const Duration(seconds: 5));
+
+    expect(sender.transfers.single.status, TransferStatus.cancelled);
+    expect(receiver.transfers.single.status, TransferStatus.cancelled);
+  });
+
+  test('cancels an active upload from the receiving device', () async {
+    final temporaryDirectory = await Directory.systemTemp.createTemp(
+      'wasla-cancel-upload-test-',
+    );
+    addTearDown(() async {
+      if (await temporaryDirectory.exists()) {
+        await temporaryDirectory.delete(recursive: true);
+      }
+    });
+
+    final receivedDirectory = Directory(
+      '${temporaryDirectory.path}${Platform.pathSeparator}received',
+    );
+    final sender = LocalTransferService(serverPort: 0);
+    final receiver = LocalTransferService(
+      serverPort: 0,
+      downloadsDirectoryProvider: () async => receivedDirectory,
+      documentsDirectoryProvider: () async => receivedDirectory,
+    );
+    addTearDown(sender.dispose);
+    addTearDown(receiver.dispose);
+    await sender.start();
+    await receiver.start();
+
+    const chunkSize = 64 * 1024;
+    const chunkCount = 256;
+    const totalBytes = chunkSize * chunkCount;
+    final target = DiscoveredDevice(
+      id: 'cancel-upload-device',
+      platform: 'test',
+      addresses: const ['127.0.0.1'],
+      port: receiver.listeningPort,
+      isResolved: true,
+    );
+    final sendFuture = sender.sendSources([
+      TransferFileSource(
+        name: 'large-cancel.bin',
+        size: totalBytes,
+        openRead: () => Stream<List<int>>.periodic(
+          const Duration(milliseconds: 10),
+          (_) => List<int>.filled(chunkSize, 7, growable: false),
+        ).take(chunkCount),
+      ),
+    ], target);
+
+    await _waitUntil(
+      () => receiver.transfers.any((transfer) => transfer.needsApproval),
+    );
+    final incoming = receiver.transfers.single;
+    receiver.accept(incoming.id);
+    await _waitUntil(
+      () =>
+          receiver.transfers.single.status == TransferStatus.transferring &&
+          receiver.transfers.single.transferredBytes > 0,
+    );
+
+    await receiver
+        .cancelTransfer(incoming.id)
+        .timeout(const Duration(seconds: 5));
+    await sendFuture.timeout(const Duration(seconds: 5));
+    await _waitUntil(
+      () => receiver.transfers.single.status == TransferStatus.cancelled,
+    );
+
+    expect(sender.transfers.single.status, TransferStatus.cancelled);
+    final remainingFiles = await receivedDirectory.exists()
+        ? await receivedDirectory
+              .list(recursive: true)
+              .where((entity) => entity is File)
+              .toList()
+        : <FileSystemEntity>[];
+    expect(remainingFiles, isEmpty);
   });
 
   test('reports intermediate progress while streaming a large file', () async {

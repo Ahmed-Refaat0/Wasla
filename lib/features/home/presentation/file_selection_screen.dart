@@ -360,29 +360,39 @@ class _FileSelectionScreenState extends State<FileSelectionScreen> {
                   child: _PickerMessage(message: _errorMessage!, isError: true),
                 ),
               Expanded(
-                child: _category == _FileCategory.apps && Platform.isAndroid
-                    ? _buildInstalledApps()
-                    : files.isEmpty
-                    ? _EmptyCategory(
-                        category: _category,
-                        onBrowse: _browseCategory,
-                        isPicking: _isPicking,
-                      )
-                    : ListView.separated(
-                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
-                        itemCount: files.length,
-                        separatorBuilder: (_, _) => const SizedBox(height: 8),
-                        itemBuilder: (context, index) {
-                          final file = files[index];
-                          return _FileTile(
-                            file: file,
-                            selected: _selectedPaths.contains(_fileKey(file)),
-                            sizeLabel: _formatSize(file.size),
-                            onChanged: (selected) =>
-                                _toggleFile(file, selected),
-                          );
-                        },
-                      ),
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 220),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  child: _category == _FileCategory.apps && Platform.isAndroid
+                      ? KeyedSubtree(
+                          key: ValueKey(_category),
+                          child: _buildInstalledApps(),
+                        )
+                      : files.isEmpty
+                      ? _EmptyCategory(
+                          key: ValueKey(_category),
+                          category: _category,
+                          onBrowse: _browseCategory,
+                          isPicking: _isPicking,
+                        )
+                      : ListView.separated(
+                          key: ValueKey(_category),
+                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
+                          itemCount: files.length,
+                          separatorBuilder: (_, _) => const SizedBox(height: 8),
+                          itemBuilder: (context, index) {
+                            final file = files[index];
+                            return _FileTile(
+                              file: file,
+                              selected: _selectedPaths.contains(_fileKey(file)),
+                              sizeLabel: _formatSize(file.size),
+                              onChanged: (selected) =>
+                                  _toggleFile(file, selected),
+                            );
+                          },
+                        ),
+                ),
               ),
               Container(
                 padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
@@ -742,6 +752,7 @@ class _InstalledAppTile extends StatelessWidget {
 
 class _EmptyCategory extends StatelessWidget {
   const _EmptyCategory({
+    super.key,
     required this.category,
     required this.onBrowse,
     required this.isPicking,

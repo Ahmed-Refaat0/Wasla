@@ -8,6 +8,7 @@ enum TransferStatus {
   completed,
   rejected,
   failed,
+  cancelled,
 }
 
 class TransferSnapshot {
@@ -21,6 +22,9 @@ class TransferSnapshot {
     required this.bytesPerSecond,
     required this.peerName,
     required this.createdAt,
+    required this.canRemove,
+    required this.isCancelling,
+    required this.canCancel,
     this.errorMessage,
     this.savedPath,
     this.pairingCode,
@@ -35,6 +39,9 @@ class TransferSnapshot {
   final double bytesPerSecond;
   final String peerName;
   final DateTime createdAt;
+  final bool canRemove;
+  final bool isCancelling;
+  final bool canCancel;
   final String? errorMessage;
   final String? savedPath;
   final String? pairingCode;

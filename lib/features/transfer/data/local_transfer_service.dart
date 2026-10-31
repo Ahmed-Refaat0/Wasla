@@ -26,6 +26,7 @@ class LocalTransferService extends ChangeNotifier {
     int? serverPort,
     Future<Directory?> Function()? downloadsDirectoryProvider,
     Future<Directory> Function()? documentsDirectoryProvider,
+    Future<List<String>> Function()? localAddressesProvider,
     AndroidDownloadPublisher? androidDownloadPublisher,
     bool Function()? isAndroid,
   }) : _serverPort = serverPort ?? port,
@@ -33,6 +34,8 @@ class LocalTransferService extends ChangeNotifier {
            downloadsDirectoryProvider ?? getDownloadsDirectory,
        _documentsDirectoryProvider =
            documentsDirectoryProvider ?? getApplicationDocumentsDirectory,
+       _localAddressesProvider =
+           localAddressesProvider ?? _discoverLocalAddresses,
        _androidDownloadPublisher =
            androidDownloadPublisher ?? AndroidDownloadPublisher(),
        _isAndroid = isAndroid ?? (() => Platform.isAndroid);
@@ -40,6 +43,7 @@ class LocalTransferService extends ChangeNotifier {
   final int _serverPort;
   final Future<Directory?> Function() _downloadsDirectoryProvider;
   final Future<Directory> Function() _documentsDirectoryProvider;
+  final Future<List<String>> Function() _localAddressesProvider;
   final AndroidDownloadPublisher _androidDownloadPublisher;
   final bool Function() _isAndroid;
   final Map<String, _TransferRecord> _records = {};
@@ -53,11 +57,13 @@ class LocalTransferService extends ChangeNotifier {
   bool _disposed = false;
   String? _serverError;
   String? _saveDirectory;
+  List<String> _localAddresses = const [];
 
   bool get isRunning => _server != null;
   int get listeningPort => _server?.port ?? _serverPort;
   String? get serverError => _serverError;
   String? get saveDirectory => _saveDirectory;
+  List<String> get localAddresses => List.unmodifiable(_localAddresses);
 
   List<TransferSnapshot> get transfers {
     final snapshots = _records.values.map((record) => record.snapshot).toList()
@@ -83,6 +89,7 @@ class LocalTransferService extends ChangeNotifier {
       _httpClient = HttpClient()
         ..connectionTimeout = const Duration(seconds: 15)
         ..idleTimeout = const Duration(seconds: 30);
+      await refreshLocalAddresses();
       server.listen(
         (request) => unawaited(_handleRequest(request)),
         onError: (Object error, StackTrace stackTrace) {
@@ -95,6 +102,20 @@ class LocalTransferService extends ChangeNotifier {
       _reportError(error, stackTrace, 'Could not start the file receiver.');
       _notifyListeners();
     }
+  }
+
+  Future<void> refreshLocalAddresses() async {
+    try {
+      _localAddresses = List.unmodifiable(await _localAddressesProvider());
+    } on SocketException catch (error, stackTrace) {
+      _reportError(
+        error,
+        stackTrace,
+        'Could not list local network addresses.',
+      );
+      _localAddresses = const [];
+    }
+    _notifyListeners();
   }
 
   Future<void> sendFiles(List<File> files, DiscoveredDevice device) async {
@@ -124,11 +145,11 @@ class LocalTransferService extends ChangeNotifier {
     }
     final address = _selectAddress(device);
     for (final source in sources) {
-      await _sendFile(source, device, address);
+      if (!await _sendFile(source, device, address)) return;
     }
   }
 
-  Future<void> _sendFile(
+  Future<bool> _sendFile(
     TransferFileSource source,
     DiscoveredDevice device,
     String address,
@@ -147,17 +168,23 @@ class LocalTransferService extends ChangeNotifier {
         ..errorMessage = 'الحد الأقصى لحجم الملف هو ٥٠ جيجابايت.';
       _records[record.id] = record;
       _notifyListeners();
-      return;
+      return true;
     }
 
     _records[record.id] = record;
+    record.remoteAddress = Uri(
+      scheme: 'http',
+      host: address,
+      port: device.port,
+    );
     _notifyListeners();
     TransferCrypto? crypto;
     try {
       final client = _httpClient;
       if (client == null) throw StateError('HTTP client is not available.');
-      final baseUri = Uri(scheme: 'http', host: address, port: device.port);
+      final baseUri = record.remoteAddress!;
       final keyPair = await TransferCrypto.createKeyPair();
+      _throwIfCancelled(record);
       final senderPublicKey = await keyPair.extractPublicKey();
       final senderNonce = TransferCrypto.createNonce();
       final handshakeBody = utf8.encode(
@@ -165,13 +192,16 @@ class LocalTransferService extends ChangeNotifier {
           'id': record.id,
           'publicKey': TransferCrypto.encodeBytes(senderPublicKey.bytes),
           'nonce': TransferCrypto.encodeBytes(senderNonce),
+          'callbackPort': listeningPort,
         }),
       );
       final handshakeResponse = await _postBytes(
         client,
         baseUri.replace(path: '/v2/handshakes'),
         handshakeBody,
+        record: record,
       );
+      _throwIfCancelled(record);
       if (handshakeResponse.statusCode != HttpStatus.ok) {
         throw HttpException(
           _readErrorMessage(await _readResponseBody(handshakeResponse)),
@@ -204,7 +234,10 @@ class LocalTransferService extends ChangeNotifier {
         senderNonce: senderNonce,
         receiverNonce: receiverNonce,
       );
+      record.crypto = crypto;
+      _throwIfCancelled(record);
       record.pairingCode = await crypto.verificationCode;
+      _throwIfCancelled(record);
       _notifyListeners();
 
       final metadata = utf8.encode(
@@ -228,6 +261,8 @@ class LocalTransferService extends ChangeNotifier {
       final offerRequest = await client.postUrl(
         baseUri.replace(path: offerPath),
       );
+      record.activeOutgoingRequest = offerRequest;
+      _throwIfCancelled(record);
       offerRequest.headers.contentType = ContentType.json;
       offerRequest.headers.set(
         HttpHeaders.authorizationHeader,
@@ -241,6 +276,11 @@ class LocalTransferService extends ChangeNotifier {
       offerRequest.add(offerBody);
       final offerResponse = await offerRequest.close();
       final offerResponseBody = await _readResponseBody(offerResponse);
+      record.activeOutgoingRequest = null;
+      _throwIfCancelled(record);
+      if (offerResponse.statusCode == HttpStatus.gone) {
+        throw const _RemoteTransferCancelledException();
+      }
       if (offerResponse.statusCode != HttpStatus.ok) {
         throw HttpException(_readErrorMessage(offerResponseBody), uri: baseUri);
       }
@@ -259,6 +299,8 @@ class LocalTransferService extends ChangeNotifier {
       final uploadRequest = await client.putUrl(
         baseUri.replace(path: uploadPath),
       );
+      record.activeOutgoingRequest = uploadRequest;
+      _throwIfCancelled(record);
       uploadRequest.headers.contentType = ContentType.binary;
       uploadRequest.headers.set(
         HttpHeaders.authorizationHeader,
@@ -292,6 +334,11 @@ class LocalTransferService extends ChangeNotifier {
 
       final uploadResponse = await uploadRequest.close();
       final responseBody = await _readResponseBody(uploadResponse);
+      record.activeOutgoingRequest = null;
+      if (uploadResponse.statusCode == HttpStatus.gone) {
+        throw const _RemoteTransferCancelledException();
+      }
+      _throwIfCancelled(record);
       if (uploadResponse.statusCode != HttpStatus.created) {
         throw HttpException(_readErrorMessage(responseBody), uri: baseUri);
       }
@@ -313,15 +360,28 @@ class LocalTransferService extends ChangeNotifier {
       _notifyListeners();
       _trimRecords();
     } catch (error, stackTrace) {
-      record
-        ..status = TransferStatus.failed
-        ..errorMessage = error.toString();
-      _reportError(error, stackTrace, 'Could not send ${record.fileName}.');
+      if (record.cancelled || error is _RemoteTransferCancelledException) {
+        record
+          ..status = TransferStatus.cancelled
+          ..errorMessage = error is _RemoteTransferCancelledException
+              ? 'ألغى الجهاز الآخر عملية النقل.'
+              : null;
+      } else {
+        record
+          ..status = TransferStatus.failed
+          ..errorMessage = error.toString();
+        _reportError(error, stackTrace, 'Could not send ${record.fileName}.');
+      }
+      record.activeOutgoingRequest = null;
       _notifyListeners();
       _trimRecords();
     } finally {
+      final remoteCancellation = record.remoteCancellation;
+      if (remoteCancellation != null) await remoteCancellation;
       crypto?.destroy();
+      record.crypto = null;
     }
+    return record.status != TransferStatus.cancelled;
   }
 
   Stream<List<int>> _encryptedChunks(
@@ -336,7 +396,9 @@ class LocalTransferService extends ChangeNotifier {
     var index = 0;
 
     Future<Uint8List> encodeFrame(List<int> clearText) async {
+      await _pauseForCancellationDecision(record);
       final box = await crypto.encryptChunk(clearText, index++);
+      await _pauseForCancellationDecision(record);
       final frame = Uint8List(4 + box.cipherText.length + box.mac.bytes.length);
       ByteData.sublistView(
         frame,
@@ -354,6 +416,7 @@ class LocalTransferService extends ChangeNotifier {
     }
 
     await for (final bytes in source.openRead()) {
+      await _pauseForCancellationDecision(record);
       sourceBytes += bytes.length;
       if (sourceBytes > source.size) {
         throw const FormatException(
@@ -383,6 +446,18 @@ class LocalTransferService extends ChangeNotifier {
       throw const FormatException('Source ended before its declared length.');
     }
     if (pending.length > 0) yield await encodeFrame(pending.takeBytes());
+  }
+
+  void _throwIfCancelled(_TransferRecord record) {
+    if (record.cancelled) throw const _LocalTransferCancelledException();
+  }
+
+  Future<void> _pauseForCancellationDecision(_TransferRecord record) async {
+    final gate = record.cancellationGate;
+    if (record.cancellationRequested && gate != null) {
+      await gate.future;
+    }
+    _throwIfCancelled(record);
   }
 
   void accept(String transferId) {
@@ -425,6 +500,283 @@ class LocalTransferService extends ChangeNotifier {
     _trimRecords();
   }
 
+  Future<void> cancelTransfer(String transferId) async {
+    final record = _records[transferId];
+    if (record == null || !record.snapshot.canCancel) return;
+    if (record.cancellationRequested) return;
+
+    if (record.direction == TransferDirection.outgoing) {
+      final crypto = record.crypto;
+      final remoteAddress = record.remoteAddress;
+      final client = _httpClient;
+      if (crypto != null && remoteAddress != null && client != null) {
+        record
+          ..cancellationRequested = true
+          ..remoteCancellationPending = true
+          ..cancellationGate = Completer<void>();
+        record.remoteCancellation = _completeOutgoingCancellation(
+          client,
+          remoteAddress,
+          record,
+          crypto,
+        );
+        _notifyListeners();
+        await record.remoteCancellation;
+        return;
+      }
+
+      record
+        ..cancelled = true
+        ..status = TransferStatus.cancelled;
+      record.activeOutgoingRequest?.abort(
+        const _LocalTransferCancelledException(),
+      );
+      record.activeOutgoingRequest = null;
+      _notifyListeners();
+      _trimRecords();
+      return;
+    }
+
+    await _cancelIncomingRecord(record);
+  }
+
+  void removeTransfer(String transferId) {
+    final record = _records[transferId];
+    if (record == null ||
+        record.snapshot.isActive ||
+        record.remoteCancellationPending) {
+      return;
+    }
+    record.uploadTimer?.cancel();
+    record.crypto?.destroy();
+    _records.remove(transferId);
+    _notifyListeners();
+  }
+
+  Future<void> _completeOutgoingCancellation(
+    HttpClient client,
+    Uri remoteAddress,
+    _TransferRecord record,
+    TransferCrypto crypto,
+  ) async {
+    try {
+      final notified = await _notifyRemoteCancellation(
+        client,
+        remoteAddress,
+        record.id,
+        crypto,
+      );
+      if (!notified) {
+        if (record.status == TransferStatus.completed) {
+          record.errorMessage = 'اكتمل النقل قبل وصول طلب الإلغاء.';
+          return;
+        }
+        record.errorMessage =
+            'تم الإلغاء على هذا الجهاز، وتعذّر إشعار الجهاز الآخر.';
+      }
+    } finally {
+      if (record.status != TransferStatus.completed) {
+        record
+          ..cancelled = true
+          ..status = TransferStatus.cancelled;
+      }
+      record
+        ..cancellationRequested = false
+        ..remoteCancellationPending = false;
+      final gate = record.cancellationGate;
+      record.cancellationGate = null;
+      if (gate != null && !gate.isCompleted) gate.complete();
+      record.activeOutgoingRequest?.abort(
+        const _LocalTransferCancelledException(),
+      );
+      record.activeOutgoingRequest = null;
+      _notifyListeners();
+      _trimRecords();
+    }
+  }
+
+  Future<bool> _notifyRemoteCancellation(
+    HttpClient client,
+    Uri remoteAddress,
+    String transferId,
+    TransferCrypto crypto,
+  ) async {
+    final path = '/v2/transfers/$transferId';
+    Object? lastError;
+    try {
+      for (var attempt = 0; attempt < 4; attempt++) {
+        try {
+          final request = await client.deleteUrl(
+            remoteAddress.replace(path: path),
+          );
+          request.headers.set(
+            HttpHeaders.authorizationHeader,
+            await crypto.authorization(
+              method: 'DELETE',
+              path: path,
+              sequence: 2,
+              body: const [],
+            ),
+          );
+          final response = await request.close().timeout(
+            const Duration(seconds: 3),
+          );
+          final responseBody = await _readResponseBody(response);
+          if (response.statusCode == HttpStatus.ok ||
+              response.statusCode == HttpStatus.noContent) {
+            return true;
+          }
+          if (response.statusCode != HttpStatus.notFound &&
+              response.statusCode != HttpStatus.conflict) {
+            throw HttpException(
+              _readErrorMessage(responseBody),
+              uri: remoteAddress,
+            );
+          }
+          lastError = HttpException(
+            _readErrorMessage(responseBody),
+            uri: remoteAddress,
+          );
+        } on SocketException catch (error) {
+          lastError = error;
+        } on HttpException catch (error) {
+          lastError = error;
+        } on TimeoutException catch (error) {
+          lastError = error;
+        }
+        if (attempt < 3) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        }
+      }
+
+      if (lastError != null) {
+        _reportError(
+          lastError,
+          StackTrace.current,
+          'Could not notify the remote device about cancellation.',
+        );
+      }
+    } on FormatException catch (error, stackTrace) {
+      _reportError(
+        error,
+        stackTrace,
+        'Could not parse the remote cancellation response.',
+      );
+      return false;
+    }
+    return false;
+  }
+
+  Future<void> _cancelIncomingRecord(
+    _TransferRecord record, {
+    bool fromRemote = false,
+  }) async {
+    if (!record.snapshot.canCancel) return;
+    final wasReceivingUpload =
+        record.status == TransferStatus.transferring &&
+        record.activeIncomingRequest != null;
+    record
+      ..cancelled = true
+      ..cancelledByRemote = fromRemote
+      ..status = TransferStatus.cancelled
+      ..uploadTimer?.cancel()
+      ..uploadTimer = null;
+    final decision = record.decision;
+    if (decision != null && !decision.isCompleted) {
+      decision.complete(false);
+    }
+    _notifyListeners();
+    if (!fromRemote && !await _notifyPeerCancellation(record)) {
+      record.errorMessage = 'تعذّر إبلاغ الجهاز المرسل بالإلغاء.';
+    }
+    if (wasReceivingUpload) {
+      final readerCancellation = record.activeReader?.cancel();
+      if (readerCancellation != null) unawaited(readerCancellation);
+      await _writeCancelledUploadResponse(record);
+      final uploadCompletion = record.incomingUploadCompletion?.future;
+      if (uploadCompletion != null) {
+        try {
+          await uploadCompletion.timeout(const Duration(seconds: 5));
+        } on TimeoutException catch (error, stackTrace) {
+          _reportError(
+            error,
+            stackTrace,
+            'The cancelled upload did not finish cleaning up in time.',
+          );
+        }
+      }
+    } else {
+      record.crypto?.destroy();
+      record.crypto = null;
+    }
+    _notifyListeners();
+    _trimRecords();
+  }
+
+  Future<bool> _notifyPeerCancellation(_TransferRecord record) async {
+    final client = _httpClient;
+    final callbackAddress = record.callbackAddress;
+    final crypto = record.crypto;
+    if (client == null || callbackAddress == null || crypto == null) {
+      return false;
+    }
+
+    final path = '/v2/transfers/${record.id}/cancelled';
+    try {
+      final request = await client.postUrl(callbackAddress.replace(path: path));
+      request
+        ..headers.set(
+          HttpHeaders.authorizationHeader,
+          await crypto.authorization(
+            method: 'POST',
+            path: path,
+            sequence: 3,
+            body: const [],
+          ),
+        )
+        ..contentLength = 0;
+      final response = await request.close().timeout(
+        const Duration(seconds: 3),
+      );
+      await response.drain<void>();
+      if (response.statusCode != HttpStatus.ok) {
+        final error = HttpException(
+          'Cancellation callback returned HTTP ${response.statusCode}.',
+          uri: callbackAddress,
+        );
+        _reportError(
+          error,
+          StackTrace.current,
+          'Could not notify the sender that the transfer was cancelled.',
+        );
+        return false;
+      }
+      return true;
+    } on Object catch (error, stackTrace) {
+      _reportError(
+        error,
+        stackTrace,
+        'Could not notify the sender that the transfer was cancelled.',
+      );
+      return false;
+    }
+  }
+
+  Future<void> _writeCancelledUploadResponse(_TransferRecord record) async {
+    final request = record.activeIncomingRequest;
+    if (request == null || record.responseClosed) return;
+    record.responseClosed = true;
+    try {
+      await _writeJson(request.response, HttpStatus.gone, {
+        'error': 'ألغى أحد الجهازين عملية النقل.',
+      });
+    } on HttpException catch (error, stackTrace) {
+      _reportError(error, stackTrace, 'Could not close the cancelled upload.');
+    } on SocketException catch (error, stackTrace) {
+      _reportError(error, stackTrace, 'Could not close the cancelled upload.');
+    }
+  }
+
   Future<void> _handleRequest(HttpRequest request) async {
     try {
       if (request.method == 'POST' && request.uri.path == '/v2/handshakes') {
@@ -433,6 +785,21 @@ class LocalTransferService extends ChangeNotifier {
       }
       if (request.method == 'POST' && request.uri.path == '/v2/offers') {
         await _handleOffer(request);
+        return;
+      }
+      if (request.method == 'POST' &&
+          request.uri.pathSegments.length == 4 &&
+          request.uri.pathSegments[0] == 'v2' &&
+          request.uri.pathSegments[1] == 'transfers' &&
+          request.uri.pathSegments[3] == 'cancelled') {
+        await _handleCancellationNotice(request, request.uri.pathSegments[2]);
+        return;
+      }
+      if (request.method == 'DELETE' &&
+          request.uri.pathSegments.length == 3 &&
+          request.uri.pathSegments[0] == 'v2' &&
+          request.uri.pathSegments[1] == 'transfers') {
+        await _handleCancellation(request, request.uri.pathSegments[2]);
         return;
       }
       if (request.method == 'PUT' &&
@@ -480,7 +847,10 @@ class LocalTransferService extends ChangeNotifier {
     if (decoded is! Map<String, dynamic> ||
         decoded['id'] is! String ||
         decoded['publicKey'] is! String ||
-        decoded['nonce'] is! String) {
+        decoded['nonce'] is! String ||
+        decoded['callbackPort'] is! int ||
+        (decoded['callbackPort'] as int) < 1 ||
+        (decoded['callbackPort'] as int) > 65535) {
       await _writeJson(request.response, HttpStatus.badRequest, {
         'error': 'بيانات المصافحة غير صالحة.',
       });
@@ -552,6 +922,11 @@ class LocalTransferService extends ChangeNotifier {
         id: id,
         crypto: crypto,
         peerAddress: peerAddress,
+        callbackAddress: Uri(
+          scheme: 'http',
+          host: peerAddress,
+          port: decoded['callbackPort'] as int,
+        ),
       );
       pending.timer = Timer(_offerTimeout, () {
         if (identical(_handshakes[id], pending)) {
@@ -574,6 +949,119 @@ class LocalTransferService extends ChangeNotifier {
         _handshakeCreationsByPeer[peerAddress] = remaining;
       }
     }
+  }
+
+  Future<void> _handleCancellation(HttpRequest request, String id) async {
+    if (!RegExp(r'^[a-f0-9]{32}$').hasMatch(id)) {
+      await _writeJson(request.response, HttpStatus.notFound, {
+        'error': 'عملية النقل غير موجودة.',
+      });
+      return;
+    }
+
+    final path = '/v2/transfers/$id';
+    final authorization = request.headers.value(
+      HttpHeaders.authorizationHeader,
+    );
+    final record = _records[id];
+    if (record != null && record.direction == TransferDirection.incoming) {
+      final crypto = record.crypto;
+      if (crypto == null ||
+          authorization == null ||
+          !await crypto.verifyAuthorization(
+            authorization: authorization,
+            method: 'DELETE',
+            path: path,
+            sequence: 2,
+            body: const [],
+          )) {
+        await _writeJson(request.response, HttpStatus.unauthorized, {
+          'error': 'تعذّر التحقق من طلب إلغاء النقل.',
+        });
+        return;
+      }
+      if (record.snapshot.isActive) {
+        if (!record.snapshot.canCancel) {
+          await _writeJson(request.response, HttpStatus.conflict, {
+            'error': 'اكتمل الملف قبل وصول طلب الإلغاء.',
+          });
+          return;
+        }
+        await _cancelIncomingRecord(record, fromRemote: true);
+      }
+      await _writeJson(request.response, HttpStatus.ok, {'cancelled': true});
+      return;
+    }
+
+    final pending = _handshakes[id];
+    if (pending == null ||
+        authorization == null ||
+        !await pending.crypto.verifyAuthorization(
+          authorization: authorization,
+          method: 'DELETE',
+          path: path,
+          sequence: 2,
+          body: const [],
+        )) {
+      await _writeJson(request.response, HttpStatus.notFound, {
+        'error': 'جلسة النقل غير موجودة أو انتهت.',
+      });
+      return;
+    }
+    if (pending.claimed) {
+      await _writeJson(request.response, HttpStatus.conflict, {
+        'error': 'طلب النقل قيد المعالجة؛ أعد المحاولة بعد لحظة.',
+      });
+      return;
+    }
+    _handshakes.remove(id);
+    pending.timer?.cancel();
+    pending.crypto.destroy();
+    await _writeJson(request.response, HttpStatus.ok, {'cancelled': true});
+  }
+
+  Future<void> _handleCancellationNotice(HttpRequest request, String id) async {
+    final record = _records[id];
+    final crypto = record?.crypto;
+    final path = '/v2/transfers/$id/cancelled';
+    final authorization = request.headers.value(
+      HttpHeaders.authorizationHeader,
+    );
+    if (record == null ||
+        record.direction != TransferDirection.outgoing ||
+        crypto == null ||
+        authorization == null ||
+        !await crypto.verifyAuthorization(
+          authorization: authorization,
+          method: 'POST',
+          path: path,
+          sequence: 3,
+          body: const [],
+        )) {
+      await _writeJson(request.response, HttpStatus.unauthorized, {
+        'error': 'تعذّر التحقق من إشعار إلغاء النقل.',
+      });
+      return;
+    }
+    if (!record.snapshot.canCancel) {
+      await _writeJson(request.response, HttpStatus.conflict, {
+        'error': 'لا يمكن إلغاء عملية النقل بعد اكتمالها.',
+      });
+      return;
+    }
+
+    record
+      ..cancelled = true
+      ..status = TransferStatus.cancelled
+      ..errorMessage = 'ألغى الجهاز الآخر عملية النقل.';
+    final cancellationGate = record.cancellationGate;
+    if (cancellationGate != null && !cancellationGate.isCompleted) {
+      cancellationGate.complete();
+    }
+    record.cancellationGate = null;
+    _notifyListeners();
+    _trimRecords();
+    await _writeJson(request.response, HttpStatus.ok, {'cancelled': true});
   }
 
   Future<void> _handleOffer(HttpRequest request) async {
@@ -674,6 +1162,7 @@ class LocalTransferService extends ChangeNotifier {
       peerName: metadata['sender'] as String,
       pairingCode: pairingCode,
       crypto: pending.crypto,
+      callbackAddress: pending.callbackAddress,
     )..decision = Completer<bool>();
     _records[id] = record;
     _notifyListeners();
@@ -683,6 +1172,10 @@ class LocalTransferService extends ChangeNotifier {
       onTimeout: () => false,
     );
     if (!accepted) {
+      if (record.cancelled && record.cancelledByRemote) {
+        _trimRecords();
+        return;
+      }
       if (record.status == TransferStatus.awaitingApproval) {
         record
           ..status = TransferStatus.failed
@@ -693,10 +1186,16 @@ class LocalTransferService extends ChangeNotifier {
       }
       await _writeJson(
         request.response,
-        record.status == TransferStatus.rejected
+        record.status == TransferStatus.cancelled
+            ? HttpStatus.gone
+            : record.status == TransferStatus.rejected
             ? HttpStatus.forbidden
             : HttpStatus.requestTimeout,
-        {'error': 'لم تتم الموافقة على استقبال الملف.'},
+        {
+          'error': record.status == TransferStatus.cancelled
+              ? 'ألغى المستلم عملية النقل.'
+              : 'لم تتم الموافقة على استقبال الملف.',
+        },
       );
       _trimRecords();
       return;
@@ -766,7 +1265,10 @@ class LocalTransferService extends ChangeNotifier {
 
     record.uploadTimer?.cancel();
     record.uploadTimer = null;
-    record.status = TransferStatus.transferring;
+    record
+      ..activeIncomingRequest = request
+      ..status = TransferStatus.transferring;
+    record.incomingUploadCompletion = Completer<void>();
     _notifyListeners();
 
     File? partialFile;
@@ -775,24 +1277,31 @@ class LocalTransferService extends ChangeNotifier {
     var committed = false;
     try {
       final directory = await _ensureSaveDirectory();
+      _throwIfCancelled(record);
       reservedDestination = await _availableDestination(
         directory,
         record.fileName,
       );
+      _throwIfCancelled(record);
       partialFile = File(
         '$directory${Platform.pathSeparator}.wasla-${record.id}.part',
       );
       await partialFile.create(exclusive: true);
+      record.partialFile = partialFile;
+      _throwIfCancelled(record);
       sink = await partialFile.open(mode: FileMode.writeOnly);
+      _throwIfCancelled(record);
       final stopwatch = Stopwatch()..start();
       var lastNotification = Duration.zero;
       final reader = _ByteStreamReader(
         request.timeout(const Duration(seconds: 45)),
       );
+      record.activeReader = reader;
       var receivedBytes = 0;
       var index = 0;
       try {
         while (receivedBytes < record.totalBytes) {
+          _throwIfCancelled(record);
           final header = await reader.readExactly(4);
           final frameLength = ByteData.sublistView(header)
               .getUint32(0, Endian.big);
@@ -810,6 +1319,7 @@ class LocalTransferService extends ChangeNotifier {
             index: index++,
             clearTextLength: plainLength,
           );
+          _throwIfCancelled(record);
           await sink.writeFrom(clearText);
           receivedBytes += clearText.length;
           record.transferredBytes = receivedBytes;
@@ -828,14 +1338,18 @@ class LocalTransferService extends ChangeNotifier {
           throw const FormatException('Unexpected trailing encrypted data.');
         }
       } finally {
+        record.activeReader = null;
         await reader.cancel();
       }
+      _throwIfCancelled(record);
       await sink.close();
       sink = null;
       final proof = await crypto.completionProof(record.totalBytes);
+      _throwIfCancelled(record);
 
       var savedPath = reservedDestination;
       if (_isAndroid()) {
+        record.isCommitting = true;
         final published = await _androidDownloadPublisher.publish(
           source: partialFile,
           fileName: record.fileName,
@@ -856,6 +1370,7 @@ class LocalTransferService extends ChangeNotifier {
           );
         }
       } else {
+        record.isCommitting = true;
         await partialFile.rename(reservedDestination);
         committed = true;
         record.status = TransferStatus.completed;
@@ -866,8 +1381,10 @@ class LocalTransferService extends ChangeNotifier {
       record.uploadTimer = null;
       crypto.destroy();
       record.crypto = null;
+      record.activeIncomingRequest = null;
       _reservedDestinations.remove(reservedDestination);
       _notifyListeners();
+      record.responseClosed = true;
       await _writeJson(request.response, HttpStatus.created, {'proof': proof});
       _trimRecords();
     } catch (error, stackTrace) {
@@ -902,33 +1419,68 @@ class LocalTransferService extends ChangeNotifier {
       if (reservedDestination != null) {
         _reservedDestinations.remove(reservedDestination);
       }
-      record
-        ..status = TransferStatus.failed
-        ..errorMessage = 'تعذّر حفظ الملف بعد استقبال البيانات.';
+      if (record.cancelled || error is _LocalTransferCancelledException) {
+        record
+          ..cancelled = true
+          ..status = TransferStatus.cancelled
+          ..errorMessage = null;
+      } else {
+        record
+          ..status = TransferStatus.failed
+          ..errorMessage = 'تعذّر حفظ الملف بعد استقبال البيانات.';
+        _reportError(error, stackTrace, 'Could not save ${record.fileName}.');
+      }
       record.uploadTimer?.cancel();
       record.uploadTimer = null;
       crypto.destroy();
       record.crypto = null;
-      _reportError(error, stackTrace, 'Could not save ${record.fileName}.');
+      record
+        ..activeIncomingRequest = null
+        ..activeReader = null
+        ..partialFile = null;
       _notifyListeners();
       _trimRecords();
-      await _writeJson(request.response, HttpStatus.internalServerError, {
-        'error': 'تعذّر حفظ الملف بعد استقبال البيانات.',
-      });
+      if (!record.responseClosed) {
+        record.responseClosed = true;
+        if (record.cancelled) {
+          await _writeJson(request.response, HttpStatus.gone, {
+            'error': 'ألغى أحد الجهازين عملية النقل.',
+          });
+        } else {
+          await _writeJson(request.response, HttpStatus.internalServerError, {
+            'error': 'تعذّر حفظ الملف بعد استقبال البيانات.',
+          });
+        }
+      }
+    } finally {
+      final completion = record.incomingUploadCompletion;
+      record.incomingUploadCompletion = null;
+      if (completion != null && !completion.isCompleted) {
+        completion.complete();
+      }
     }
   }
 
   Future<HttpClientResponse> _postBytes(
     HttpClient client,
     Uri uri,
-    List<int> body,
-  ) async {
+    List<int> body, {
+    required _TransferRecord record,
+  }) async {
     final request = await client.postUrl(uri);
+    record.activeOutgoingRequest = request;
+    _throwIfCancelled(record);
     request
       ..headers.contentType = ContentType.json
       ..contentLength = body.length
       ..add(body);
-    return request.close();
+    try {
+      return await request.close();
+    } finally {
+      if (identical(record.activeOutgoingRequest, request)) {
+        record.activeOutgoingRequest = null;
+      }
+    }
   }
 
   Future<String> _ensureSaveDirectory() async {
@@ -1151,11 +1703,13 @@ class _PendingHandshake {
     required this.id,
     required this.crypto,
     required this.peerAddress,
+    required this.callbackAddress,
   });
 
   final String id;
   final TransferCrypto crypto;
   final String peerAddress;
+  final Uri callbackAddress;
   Timer? timer;
   bool claimed = false;
 }
@@ -1170,6 +1724,7 @@ class _TransferRecord {
     required this.peerName,
     this.pairingCode,
     this.crypto,
+    this.callbackAddress,
   });
 
   final String id;
@@ -1185,8 +1740,23 @@ class _TransferRecord {
   String? savedPath;
   String? pairingCode;
   TransferCrypto? crypto;
+  final Uri? callbackAddress;
   Completer<bool>? decision;
+  Completer<void>? incomingUploadCompletion;
   Timer? uploadTimer;
+  Uri? remoteAddress;
+  HttpClientRequest? activeOutgoingRequest;
+  HttpRequest? activeIncomingRequest;
+  _ByteStreamReader? activeReader;
+  File? partialFile;
+  Future<void>? remoteCancellation;
+  bool cancelled = false;
+  bool cancelledByRemote = false;
+  bool responseClosed = false;
+  bool remoteCancellationPending = false;
+  bool cancellationRequested = false;
+  bool isCommitting = false;
+  Completer<void>? cancellationGate;
 
   TransferSnapshot get snapshot => TransferSnapshot(
     id: id,
@@ -1201,7 +1771,18 @@ class _TransferRecord {
     savedPath: savedPath,
     pairingCode: pairingCode,
     createdAt: createdAt,
+    canRemove: !snapshotIsActive && !remoteCancellationPending,
+    isCancelling: cancellationRequested || remoteCancellationPending,
+    canCancel: snapshotIsActive && !isCommitting && !cancellationRequested,
   );
+
+  bool get snapshotIsActive => switch (status) {
+    TransferStatus.requesting ||
+    TransferStatus.awaitingApproval ||
+    TransferStatus.waitingForUpload ||
+    TransferStatus.transferring => true,
+    _ => false,
+  };
 }
 
 class _ByteStreamReader {
@@ -1241,4 +1822,37 @@ class _ByteStreamReader {
   }
 
   Future<void> cancel() => _iterator.cancel();
+}
+
+class _LocalTransferCancelledException implements Exception {
+  const _LocalTransferCancelledException();
+}
+
+class _RemoteTransferCancelledException implements Exception {
+  const _RemoteTransferCancelledException();
+}
+
+Future<List<String>> _discoverLocalAddresses() async {
+  final interfaces = await NetworkInterface.list(
+    includeLoopback: false,
+    includeLinkLocal: false,
+  );
+  final addresses = <InternetAddress>{};
+  for (final interface in interfaces) {
+    for (final address in interface.addresses) {
+      if (!address.isLoopback &&
+          !address.isLinkLocal &&
+          address.address != '0.0.0.0') {
+        addresses.add(address);
+      }
+    }
+  }
+  final result = addresses.toList()
+    ..sort((left, right) {
+      if (left.type != right.type) {
+        return left.type == InternetAddressType.IPv4 ? -1 : 1;
+      }
+      return left.address.compareTo(right.address);
+    });
+  return result.map((address) => address.address).toList();
 }

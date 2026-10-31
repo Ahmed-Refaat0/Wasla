@@ -54,6 +54,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _retryLocalServices() async {
     await _transfers.start();
     if (mounted && _transfers.isRunning) {
+      await _transfers.refreshLocalAddresses();
       await _discovery.restart();
     }
   }
@@ -73,9 +74,10 @@ class _HomeScreenState extends State<HomeScreen> {
         await _hotspot.stop();
       } else {
         await _hotspot.start();
-        if (mounted && _transfers.isRunning) {
-          await _discovery.restart();
-        }
+      }
+      if (mounted && _transfers.isRunning) {
+        await _transfers.refreshLocalAddresses();
+        await _discovery.restart();
       }
     } catch (error) {
       if (mounted) _showMessage(_hotspot.errorMessage ?? error.toString());
@@ -97,11 +99,22 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _copyLocalAddress(String address) async {
+    try {
+      await Clipboard.setData(ClipboardData(text: address));
+      if (mounted) _showMessage('تم نسخ عنوان IP.');
+    } catch (error) {
+      if (mounted) _showMessage('تعذّر نسخ عنوان IP: $error');
+    }
+  }
+
   Future<void> _pickFilesAndSend({DiscoveredDevice? device}) async {
     try {
       if (!_transfers.isRunning) {
         throw StateError('خادم الاستقبال المحلي غير جاهز.');
       }
+      final target = device ?? await _chooseDevice();
+      if (target == null || !mounted) return;
 
       final sources = await Navigator.of(context)
           .push<List<TransferFileSource>>(
@@ -110,7 +123,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           );
       if (sources == null || sources.isEmpty || !mounted) return;
-      await _sendSources(sources, device: device);
+      await _sendSources(sources, device: target);
     } catch (error) {
       if (mounted) _showMessage(error.toString());
     }
@@ -118,6 +131,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _sendDroppedItems(List<DropItem> items) async {
     try {
+      final target = await _chooseDevice();
+      if (target == null || !mounted) return;
       final sources = <TransferFileSource>[];
       for (final item in items) {
         if (item is! DropItemFile) {
@@ -132,7 +147,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
       }
-      await _sendSources(sources);
+      await _sendSources(sources, device: target);
     } catch (error) {
       if (mounted) _showMessage(error.toString());
     }
@@ -311,6 +326,17 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _cancelTransfer(String transferId) async {
+    try {
+      await _transfers.cancelTransfer(transferId);
+      if (mounted) _showMessage('تم إلغاء عملية النقل.');
+    } on StateError catch (error) {
+      if (mounted) _showMessage(error.message);
+    } on SocketException catch (error) {
+      if (mounted) _showMessage('تعذّر إكمال الإلغاء: ${error.message}');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Directionality(
@@ -325,149 +351,219 @@ class _HomeScreenState extends State<HomeScreen> {
                 final isWide = constraints.maxWidth >= 940;
                 final horizontalPadding = constraints.maxWidth >= 700
                     ? 36.0
-                    : 20.0;
+                    : 16.0;
 
                 return Center(
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 1240),
-                    child: ListView(
-                      padding: EdgeInsets.fromLTRB(
-                        horizontalPadding,
-                        20,
-                        horizontalPadding,
-                        36,
+                    child: TweenAnimationBuilder<double>(
+                      tween: Tween(begin: 0, end: 1),
+                      duration: const Duration(milliseconds: 420),
+                      curve: Curves.easeOutCubic,
+                      builder: (context, progress, child) => Opacity(
+                        opacity: progress,
+                        child: Transform.translate(
+                          offset: Offset(0, 12 * (1 - progress)),
+                          child: child,
+                        ),
                       ),
-                      children: [
-                        _TopBar(
-                          isDarkMode: widget.isDarkMode,
-                          onToggleTheme: () => unawaited(_toggleTheme()),
+                      child: ListView(
+                        padding: EdgeInsets.fromLTRB(
+                          horizontalPadding,
+                          16,
+                          horizontalPadding,
+                          36,
                         ),
-                        const SizedBox(height: 34),
-                        _PageHeading(
-                          isSearching: _discovery.isSearching,
-                          onSearch: () {
-                            if (_transfers.isRunning) {
-                              unawaited(_discovery.restart());
-                            } else {
-                              _showMessage(
-                                _transfers.serverError ??
-                                    'خادم الاستقبال المحلي غير جاهز.',
-                              );
-                            }
-                          },
-                        ),
-                        const SizedBox(height: 20),
-                        AnimatedBuilder(
-                          animation: _hotspot,
-                          builder: (context, _) => _LocalHotspotPanel(
-                            isAndroid: Platform.isAndroid,
-                            isWindows: Platform.isWindows,
-                            isActive: _hotspot.isActive,
-                            isBusy: _hotspot.isBusy,
-                            ssid: _hotspot.ssid,
-                            passphrase: _hotspot.passphrase,
-                            onToggle: () => unawaited(_toggleHotspot()),
-                            onCopy: () => unawaited(_copyHotspotCredentials()),
+                        children: [
+                          _TopBar(
+                            isDarkMode: widget.isDarkMode,
+                            onToggleTheme: () => unawaited(_toggleTheme()),
                           ),
-                        ),
-                        const SizedBox(height: 24),
-                        AnimatedBuilder(
-                          animation: _transfers,
-                          builder: (context, _) => _TransferModeSelector(
-                            mode: _mode,
-                            pendingIncomingCount: _transfers.transfers
-                                .where((transfer) => transfer.needsApproval)
-                                .length,
-                            onChanged: (mode) => setState(() => _mode = mode),
+                          const SizedBox(height: 34),
+                          _PageHeading(
+                            isSearching: _discovery.isSearching,
+                            onSearch: () {
+                              if (_transfers.isRunning) {
+                                unawaited(_discovery.restart());
+                              } else {
+                                _showMessage(
+                                  _transfers.serverError ??
+                                      'خادم الاستقبال المحلي غير جاهز.',
+                                );
+                              }
+                            },
                           ),
-                        ),
-                        const SizedBox(height: 16),
-                        if (_mode == _HomeMode.send) ...[
-                          if (isWide)
-                            Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Expanded(
-                                  flex: 11,
-                                  child: _DevicesPanel(
-                                    devices: _discovery.devices,
-                                    status: _discovery.status,
-                                    errorMessage: _discovery.errorMessage,
-                                    onRetry: () =>
-                                        unawaited(_discovery.restart()),
-                                    onManualConnect: () =>
-                                        unawaited(_sendToManualAddress()),
-                                    onDeviceSelected: (device) =>
-                                        unawaited(_sendToDevice(device)),
-                                  ),
-                                ),
-                                const SizedBox(width: 20),
-                                Expanded(
-                                  flex: 9,
-                                  child: _SendPanel(
-                                    onChooseFiles: () =>
-                                        unawaited(_pickFilesAndSend()),
-                                    onFilesDropped: _sendDroppedItems,
-                                  ),
-                                ),
-                              ],
-                            )
-                          else ...[
-                            _DevicesPanel(
-                              devices: _discovery.devices,
-                              status: _discovery.status,
-                              errorMessage: _discovery.errorMessage,
-                              onRetry: () => unawaited(_discovery.restart()),
-                              onManualConnect: () =>
-                                  unawaited(_sendToManualAddress()),
-                              onDeviceSelected: (device) =>
-                                  unawaited(_sendToDevice(device)),
-                            ),
-                            const SizedBox(height: 16),
-                            _SendPanel(
-                              onChooseFiles: () =>
-                                  unawaited(_pickFilesAndSend()),
-                              onFilesDropped: _sendDroppedItems,
-                            ),
-                          ],
-                        ] else ...[
+                          const SizedBox(height: 20),
                           AnimatedBuilder(
                             animation: _transfers,
-                            builder: (context, _) => _ReceiveReadyPanel(
-                              isRunning: _transfers.isRunning,
-                              saveDirectory: _transfers.saveDirectory,
-                              serverError: _transfers.serverError,
-                              onRetry: () => unawaited(_retryLocalServices()),
+                            builder: (context, _) => _LocalAddressPanel(
+                              addresses: _transfers.localAddresses,
+                              port: _transfers.listeningPort,
+                              onRefresh: () =>
+                                  unawaited(_transfers.refreshLocalAddresses()),
+                              onCopy: (address) =>
+                                  unawaited(_copyLocalAddress(address)),
                             ),
                           ),
-                        ],
-                        const SizedBox(height: 20),
-                        AnimatedBuilder(
-                          animation: _transfers,
-                          builder: (context, _) => _TransfersPanel(
-                            transfers: _transfers.transfers
-                                .where(
-                                  (transfer) =>
-                                      transfer.direction ==
-                                      (_mode == _HomeMode.send
-                                          ? TransferDirection.outgoing
-                                          : TransferDirection.incoming),
-                                )
-                                .toList(),
-                            title: _mode == _HomeMode.send
-                                ? 'الملفات المرسلة'
-                                : 'الملفات المستلمة',
-                            serverError: null,
-                            saveDirectory: null,
-                            onAccept: _transfers.accept,
-                            onReject: _transfers.reject,
-                            onRetryServer: () =>
-                                unawaited(_retryLocalServices()),
+                          const SizedBox(height: 16),
+                          AnimatedBuilder(
+                            animation: _hotspot,
+                            builder: (context, _) => _LocalHotspotPanel(
+                              isAndroid: Platform.isAndroid,
+                              isWindows: Platform.isWindows,
+                              isActive: _hotspot.isActive,
+                              isBusy: _hotspot.isBusy,
+                              ssid: _hotspot.ssid,
+                              passphrase: _hotspot.passphrase,
+                              onToggle: () => unawaited(_toggleHotspot()),
+                              onCopy: () =>
+                                  unawaited(_copyHotspotCredentials()),
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 18),
-                        const _PrivacyNote(),
-                      ],
+                          const SizedBox(height: 24),
+                          AnimatedBuilder(
+                            animation: _transfers,
+                            builder: (context, _) => _TransferModeSelector(
+                              mode: _mode,
+                              pendingIncomingCount: _transfers.transfers
+                                  .where((transfer) => transfer.needsApproval)
+                                  .length,
+                              onChanged: (mode) => setState(() => _mode = mode),
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 260),
+                            switchInCurve: Curves.easeOutCubic,
+                            switchOutCurve: Curves.easeInCubic,
+                            transitionBuilder: (child, animation) =>
+                                FadeTransition(
+                                  opacity: animation,
+                                  child: SlideTransition(
+                                    position: Tween<Offset>(
+                                      begin: const Offset(0, 0.025),
+                                      end: Offset.zero,
+                                    ).animate(animation),
+                                    child: child,
+                                  ),
+                                ),
+                            child: _mode == _HomeMode.send
+                                ? Column(
+                                    key: const ValueKey<_HomeMode>(
+                                      _HomeMode.send,
+                                    ),
+                                    children: [
+                                      if (isWide)
+                                        Row(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Expanded(
+                                              flex: 11,
+                                              child: _DevicesPanel(
+                                                devices: _discovery.devices,
+                                                status: _discovery.status,
+                                                errorMessage:
+                                                    _discovery.errorMessage,
+                                                onRetry: () => unawaited(
+                                                  _discovery.restart(),
+                                                ),
+                                                onManualConnect: () =>
+                                                    unawaited(
+                                                      _sendToManualAddress(),
+                                                    ),
+                                                onDeviceSelected: (device) =>
+                                                    unawaited(
+                                                      _sendToDevice(device),
+                                                    ),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 20),
+                                            Expanded(
+                                              flex: 9,
+                                              child: _SendPanel(
+                                                onChooseFiles: () => unawaited(
+                                                  _pickFilesAndSend(),
+                                                ),
+                                                onFilesDropped:
+                                                    _sendDroppedItems,
+                                              ),
+                                            ),
+                                          ],
+                                        )
+                                      else ...[
+                                        _DevicesPanel(
+                                          devices: _discovery.devices,
+                                          status: _discovery.status,
+                                          errorMessage: _discovery.errorMessage,
+                                          onRetry: () =>
+                                              unawaited(_discovery.restart()),
+                                          onManualConnect: () =>
+                                              unawaited(_sendToManualAddress()),
+                                          onDeviceSelected: (device) =>
+                                              unawaited(_sendToDevice(device)),
+                                        ),
+                                        const SizedBox(height: 16),
+                                        _SendPanel(
+                                          onChooseFiles: () =>
+                                              unawaited(_pickFilesAndSend()),
+                                          onFilesDropped: _sendDroppedItems,
+                                        ),
+                                      ],
+                                    ],
+                                  )
+                                : Column(
+                                    key: const ValueKey<_HomeMode>(
+                                      _HomeMode.receive,
+                                    ),
+                                    children: [
+                                      AnimatedBuilder(
+                                        animation: _transfers,
+                                        builder: (context, _) =>
+                                            _ReceiveReadyPanel(
+                                              isRunning: _transfers.isRunning,
+                                              saveDirectory:
+                                                  _transfers.saveDirectory,
+                                              serverError:
+                                                  _transfers.serverError,
+                                              onRetry: () => unawaited(
+                                                _retryLocalServices(),
+                                              ),
+                                            ),
+                                      ),
+                                    ],
+                                  ),
+                          ),
+                          const SizedBox(height: 20),
+                          AnimatedBuilder(
+                            animation: _transfers,
+                            builder: (context, _) => _TransfersPanel(
+                              transfers: _transfers.transfers
+                                  .where(
+                                    (transfer) =>
+                                        transfer.direction ==
+                                        (_mode == _HomeMode.send
+                                            ? TransferDirection.outgoing
+                                            : TransferDirection.incoming),
+                                  )
+                                  .toList(),
+                              title: _mode == _HomeMode.send
+                                  ? 'الملفات المرسلة'
+                                  : 'الملفات المستلمة',
+                              serverError: null,
+                              saveDirectory: null,
+                              onAccept: _transfers.accept,
+                              onReject: _transfers.reject,
+                              onRetryServer: () =>
+                                  unawaited(_retryLocalServices()),
+                              onCancel: (id) => unawaited(_cancelTransfer(id)),
+                              onRemove: _transfers.removeTransfer,
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          const _PrivacyNote(),
+                        ],
+                      ),
                     ),
                   ),
                 );
@@ -539,6 +635,87 @@ class _TopBar extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _LocalAddressPanel extends StatelessWidget {
+  const _LocalAddressPanel({
+    required this.addresses,
+    required this.port,
+    required this.onRefresh,
+    required this.onCopy,
+  });
+
+  final List<String> addresses;
+  final int port;
+  final VoidCallback onRefresh;
+  final ValueChanged<String> onCopy;
+
+  String _formatAddress(String address) =>
+      address.contains(':') ? '[$address]:$port' : '$address:$port';
+
+  @override
+  Widget build(BuildContext context) {
+    return _Panel(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Row(
+        children: [
+          _SectionIcon(
+            icon: Icons.lan_rounded,
+            background: AppColors.blueTint,
+            foreground: AppColors.blue,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'عنوان هذا الجهاز',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 3),
+                if (addresses.isEmpty)
+                  Text(
+                    'لم يظهر عنوان شبكة بعد. اتصل بالـ Wi-Fi ثم حدّث.',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  )
+                else ...[
+                  Text(
+                    'أدخله في الجهاز الآخر · المنفذ $port',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    children: [
+                      for (final address in addresses)
+                        ActionChip(
+                          avatar: const Icon(Icons.copy_rounded, size: 15),
+                          label: Directionality(
+                            textDirection: TextDirection.ltr,
+                            child: Text(_formatAddress(address)),
+                          ),
+                          onPressed: () => onCopy(address),
+                          visualDensity: VisualDensity.compact,
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                        ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+          IconButton(
+            onPressed: onRefresh,
+            tooltip: 'تحديث عناوين الشبكة',
+            icon: const Icon(Icons.refresh_rounded),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1025,12 +1202,12 @@ class _DevicesPanel extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'الأجهزة القريبة',
+                      '١ · اختر الجهاز المستلم',
                       style: Theme.of(context).textTheme.titleLarge,
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      'تظهر هنا الأجهزة المتاحة للإرسال',
+                      'اختر جهازًا قريبًا أو أدخل عنوان IP يدويًا',
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
                   ],
@@ -1311,12 +1488,12 @@ class _SendPanelState extends State<_SendPanel> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'إرسال ملفات',
+                    '٢ · اختر الملفات',
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                   const SizedBox(height: 2),
                   Text(
-                    'اختر ما تريد مشاركته',
+                    'بعد اختيار المستلم، حدد ما تريد إرساله',
                     style: Theme.of(context).textTheme.bodyMedium,
                   ),
                 ],
@@ -1334,8 +1511,10 @@ class _SendPanelState extends State<_SendPanel> {
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 150),
               width: double.infinity,
-              constraints: const BoxConstraints(minHeight: 230),
-              padding: const EdgeInsets.all(22),
+              constraints: BoxConstraints(
+                minHeight: supportsDesktopDrop ? 200 : 176,
+              ),
+              padding: EdgeInsets.all(supportsDesktopDrop ? 22 : 16),
               decoration: BoxDecoration(
                 color: _isDragging
                     ? AppColors.brandTint
@@ -1362,7 +1541,7 @@ class _SendPanelState extends State<_SendPanel> {
                       size: 29,
                     ),
                   ),
-                  const SizedBox(height: 13),
+                  const SizedBox(height: 10),
                   Text(
                     supportsDesktopDrop
                         ? 'أفلت ملفاتك هنا'
@@ -1379,7 +1558,7 @@ class _SendPanelState extends State<_SendPanel> {
                   OutlinedButton.icon(
                     onPressed: widget.onChooseFiles,
                     icon: const Icon(Icons.add_rounded, size: 18),
-                    label: const Text('اختر ملفات'),
+                    label: const Text('اختر الجهاز والملفات'),
                   ),
                 ],
               ),
@@ -1417,6 +1596,8 @@ class _TransfersPanel extends StatelessWidget {
     required this.onAccept,
     required this.onReject,
     required this.onRetryServer,
+    required this.onCancel,
+    required this.onRemove,
   });
 
   final List<TransferSnapshot> transfers;
@@ -1426,6 +1607,8 @@ class _TransfersPanel extends StatelessWidget {
   final ValueChanged<String> onAccept;
   final ValueChanged<String> onReject;
   final VoidCallback onRetryServer;
+  final ValueChanged<String> onCancel;
+  final ValueChanged<String> onRemove;
 
   @override
   Widget build(BuildContext context) {
@@ -1496,6 +1679,8 @@ class _TransfersPanel extends StatelessWidget {
                 transfer: transfers[index],
                 onAccept: () => onAccept(transfers[index].id),
                 onReject: () => onReject(transfers[index].id),
+                onCancel: () => onCancel(transfers[index].id),
+                onRemove: () => onRemove(transfers[index].id),
               ),
               if (index != transfers.length - 1)
                 Divider(height: 1, color: AppColors.line),
@@ -1512,29 +1697,38 @@ class _TransferRow extends StatelessWidget {
     required this.transfer,
     required this.onAccept,
     required this.onReject,
+    required this.onCancel,
+    required this.onRemove,
   });
 
   final TransferSnapshot transfer;
   final VoidCallback onAccept;
   final VoidCallback onReject;
+  final VoidCallback onCancel;
+  final VoidCallback onRemove;
 
   @override
   Widget build(BuildContext context) {
     final incoming = transfer.direction == TransferDirection.incoming;
-    final status = switch (transfer.status) {
-      TransferStatus.requesting => 'جارٍ طلب الموافقة من المستلم...',
-      TransferStatus.awaitingApproval =>
-        'يريد ${_platformLabel(transfer.peerName)} إرسال ملف إليك',
-      TransferStatus.waitingForUpload => 'تمت الموافقة؛ جارٍ انتظار الملف...',
-      TransferStatus.transferring =>
-        '${_formatBytes(transfer.transferredBytes)} / ${_formatBytes(transfer.totalBytes)} · '
-            '${(transfer.progress * 100).toStringAsFixed(1)}٪ · '
-            '${_formatSpeed(transfer.bytesPerSecond)}',
-      TransferStatus.completed =>
-        incoming ? 'اكتمل الاستقبال' : 'اكتمل الإرسال',
-      TransferStatus.rejected => 'تم رفض الاستقبال',
-      TransferStatus.failed => transfer.errorMessage ?? 'فشل نقل الملف',
-    };
+    final status = transfer.isCancelling
+        ? 'جارٍ إلغاء النقل...'
+        : switch (transfer.status) {
+            TransferStatus.requesting => 'جارٍ طلب الموافقة من المستلم...',
+            TransferStatus.awaitingApproval =>
+              'يريد ${_platformLabel(transfer.peerName)} إرسال ملف إليك',
+            TransferStatus.waitingForUpload =>
+              'تمت الموافقة؛ جارٍ انتظار الملف...',
+            TransferStatus.transferring =>
+              '${_formatBytes(transfer.transferredBytes)} / ${_formatBytes(transfer.totalBytes)} · '
+                  '${(transfer.progress * 100).toStringAsFixed(1)}٪ · '
+                  '${_formatSpeed(transfer.bytesPerSecond)}',
+            TransferStatus.completed =>
+              incoming ? 'اكتمل الاستقبال' : 'اكتمل الإرسال',
+            TransferStatus.rejected => 'تم رفض الاستقبال',
+            TransferStatus.failed => transfer.errorMessage ?? 'فشل نقل الملف',
+            TransferStatus.cancelled =>
+              transfer.errorMessage ?? 'تم إلغاء عملية النقل',
+          };
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 14),
@@ -1562,6 +1756,33 @@ class _TransferRow extends StatelessWidget {
                 _formatBytes(transfer.totalBytes),
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
+              if (transfer.isActive && !transfer.needsApproval)
+                IconButton(
+                  onPressed: transfer.canCancel ? onCancel : null,
+                  tooltip: transfer.isCancelling
+                      ? 'جارٍ إلغاء النقل'
+                      : 'إلغاء النقل',
+                  visualDensity: VisualDensity.compact,
+                  icon: transfer.canCancel
+                      ? const Icon(Icons.cancel_outlined)
+                      : const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                  color: AppColors.danger,
+                )
+              else if (!transfer.isActive)
+                IconButton(
+                  onPressed: transfer.canRemove ? onRemove : null,
+                  tooltip: 'إزالة من السجل',
+                  visualDensity: VisualDensity.compact,
+                  icon: transfer.canRemove
+                      ? const Icon(Icons.delete_outline_rounded)
+                      : const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                ),
             ],
           ),
           const SizedBox(height: 7),
